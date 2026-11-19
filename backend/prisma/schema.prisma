@@ -1,0 +1,1028 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Gym {
+  id                            String   @id @default(uuid())
+  name                          String
+  address                       String?
+  phone                         String?
+  email                         String?
+  status                        String   @default("Active")
+  images                        String[] @default([])
+  latitude                      Float?
+  longitude                     Float?
+  // Per-gym default session duration (minutes). Controls how long a FitPrime
+  // session stays active before auto-closing. Default 2 hours.
+  defaultSessionDurationMinutes Int      @default(120)
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @updatedAt
+  settings                      GymSettings?
+  discoveryProfile              GymProfile?
+  posts                         GymPost[]
+  automationRules               CommunicationAutomationRule[]
+  communicationPreferences      CommunicationPreference[]
+  communicationMessages         CommunicationMessage[]
+
+  @@index([status])
+}
+
+model GymSettings {
+  id              String   @id @default(uuid())
+  gymId           String   @unique
+  gym             Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  
+  // Branding
+  gymName         String   @default("GYM CRM PRO")
+  tagline         String   @default("Elevate Your Fitness Operations")
+  logoUrl         String   @default("https://images.unsplash.com/photo-1517838277536-f5f99be501cd?w=80&auto=format&fit=crop&q=60")
+  brandTheme      String   @default("dark")
+  
+  // Operations
+  sessionDuration Int      @default(120)
+  scanCooldown    Int      @default(300)
+  qrRefreshRate   Int      @default(15)
+  checkInSound    Boolean  @default(true)
+  
+  // Finance
+  currency        String   @default("INR")
+  taxRate         Float    @default(18)
+  taxId           String   @default("27AAAAA1111A1Z1")
+  razorpayEnabled Boolean  @default(true)
+  razorpayKey     String   @default("rzp_test_xxxxxxxxx")
+  
+  // Notifications
+  emailAlerts     Boolean  @default(true)
+  smsAlerts       Boolean  @default(false)
+  pushAlerts      Boolean  @default(true)
+  
+  // Business Hours (Stored as JSON string)
+  hours           String   @default("{\"weekday\":\"06:00 AM - 10:00 PM\",\"saturday\":\"07:00 AM - 08:00 PM\",\"sunday\":\"08:00 AM - 02:00 PM\"}")
+
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([gymId])
+}
+
+model User {
+  id                  String    @id @default(uuid())
+  name                String
+  email               String    @unique
+  password            String
+  phone               String?
+  profileImageUrl     String?
+  registrationNumber  String?
+  role                String    @default("admin")
+  gymId               String
+  memberId            String?
+  isVerified          Boolean   @default(false)
+  status              String    @default("Active")
+  isActive            Boolean   @default(true)
+  lastLogin           DateTime?
+  // --- Web login brute-force protection (email+password login) ---
+  failedLoginAttempts Int       @default(0)
+  // Account is locked (cannot login) until this timestamp passes. Null = not locked.
+  lockUntil           DateTime?
+  branchId            String?
+  trainerMemberLimit  Int       @default(10)
+  trainerPermissions  Json      @default("{}")
+  fitPassPayoutAccess Boolean   @default(false)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([gymId])
+  @@index([role])
+  @@index([gymId, role])
+}
+
+model Plan {
+  id             String   @id @default(uuid())
+  name           String
+  duration       Int      // duration value (used by traditional gym membership plans)
+  durationUnit   String   @default("days") // e.g. "days", "hours" (traditional plans)
+  // FitPrime (SYSTEM) plans grant a number of sessions instead of a time-based duration.
+  // Null/0 for traditional plans; set only on FitPrime global plans.
+  sessions       Int?
+  coinAllowance  Int      @default(0)
+  coinInputMode  String   @default("sessions")
+  displayCoins   Boolean  @default(true)
+  displayCheckIns Boolean @default(true)
+  price          Float
+  gymId          String
+  branchId       String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([gymId])
+}
+
+model Member {
+  id                    String   @id @default(uuid())
+  registrationNumber    String?  @unique
+  name                  String
+  phone                 String
+  email                 String?
+  heightCm              Float?
+  planId                String?
+  joinDate              DateTime @default(now())
+  expiryDate            DateTime?
+  status                String   @default("Active")
+  scheduledUnfreezeAt   DateTime?
+  planPrice             Float    @default(0)
+  paidAmount            Float    @default(0)
+  gymId                 String
+  branchId              String?
+  freezeHistory         String?  // stored as JSON string
+  // --- FitPrime session-based check-in fields ---
+  // Live session credit counter for FitPrime (SYSTEM) plan holders.
+  sessionsRemaining     Int      @default(0)
+  // Original session count granted by the purchased FitPrime plan (reference/audit).
+  sessionsTotal         Int      @default(0)
+  // Separate non-transferable balances. FitPass coins can fund partner check-ins
+  // and FitPass store items; H4 coins are only for H4 membership use.
+  fitpassCoins          Int      @default(0)
+  h4Coins               Int      @default(0)
+  coinsMigrated         Boolean  @default(false)
+  // Timestamp of the last successful QR scan (drives analytics/history).
+  lastCheckInAt         DateTime?
+  // When the currently-active session auto-expires (startedAt + gym.defaultSessionDurationMinutes).
+  // Null when no session is active. Authoritative gate for the "active session → 409" check.
+  currentSessionEndsAt  DateTime?
+  // The gym whose QR was scanned for the active session.
+  currentSessionGymId   String?
+  // Cooldown gate (authoritative): now < cooldownEndsAt → 429. Equals sessionEndsAt + 3h.
+  cooldownEndsAt        DateTime?
+  communicationPreferences CommunicationPreference[]
+  communicationMessages CommunicationMessage[]
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([gymId])
+  @@index([status])
+  @@index([gymId, status])
+  @@index([expiryDate])
+  @@index([phone])
+  @@index([planId])
+}
+
+model Attendance {
+  id          String   @id @default(uuid())
+  memberId    String
+  date        DateTime @default(now())
+  checkInTime String
+  gymId       String
+  branchId    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([gymId, date])
+  @@index([memberId])
+}
+
+// Audit-grade record of every FitPrime QR scan / session start.
+// One row per successful check-in. Status moves active → expired via cron/lazy expiry.
+model SessionCheckIn {
+  id         String   @id @default(uuid())
+  memberId   String
+  gymId      String                      // the gym whose QR was scanned
+  gymName    String   @default("")
+  branchId   String?
+  branchName String   @default("")
+  startedAt  DateTime @default(now())
+  expiresAt  DateTime                    // startedAt + gym.defaultSessionDurationMinutes
+  status     String   @default("active") // "active" | "expired"
+  createdAt  DateTime @default(now())
+
+  @@index([gymId, status])
+  @@index([gymId, startedAt])
+  @@index([memberId])
+}
+
+model FitPassAuditLog {
+  id                     String   @id @default(uuid())
+  memberId               String
+  memberName             String
+  fitPassMembershipId    String
+  organizationId         String
+  branchId               String?
+  gymIdVisited           String
+  gymName                String
+  branchIdVisited        String?
+  branchNameVisited      String?
+  checkInTimestamp       DateTime @default(now())
+  accessStatus           String
+  failureReason          String?
+  totalPurchasedSessions Int
+  sessionsUsedBefore     Int
+  sessionsDeducted       Int
+  remainingSessionsAfter Int
+  membershipExpiryDate   DateTime
+  qrCodeUsed             String
+  deviceInfo             String?
+  createdBySystem        Boolean  @default(true)
+  createdAt              DateTime @default(now())
+
+  @@index([memberId])
+  @@index([gymIdVisited])
+  @@index([accessStatus])
+  @@index([createdAt])
+}
+
+model FitPassPayoutSettings {
+  id                   String   @id @default("global")
+  defaultRatePerCheckIn Float   @default(50)
+  updatedBy            String?
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+model FitPassBranchPayout {
+  id                  String   @id @default(uuid())
+  gymId               String
+  gymName             String
+  branchId            String
+  branchName          String
+  periodStart         DateTime
+  periodEnd           DateTime
+  checkInCount        Int      @default(0)
+  ratePerCheckIn      Float    @default(50)
+  manualRevenue       Float?
+  grossRevenue        Float    @default(0)
+  paidAmount          Float    @default(0)
+  operatingCosts      Float    @default(0)
+  retainedAmount      Float    @default(0)
+  netProfit           Float    @default(0)
+  paymentReference    String?
+  notes               String?
+  status              String   @default("Unpaid") // Unpaid, Partial, Paid
+  paidAt              DateTime?
+  createdBy           String
+  isDemo              Boolean  @default(false)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@unique([branchId, periodStart, periodEnd])
+  @@index([gymId, periodStart, periodEnd])
+  @@index([branchId, periodStart])
+  @@index([status, periodStart])
+}
+
+
+model Payment {
+  id            String   @id @default(uuid())
+  memberId      String
+  amount        Float
+  method        String
+  date          DateTime @default(now())
+  gymId         String
+  branchId      String?
+  transactionId String?
+  saleType      String   @default("LEGACY")
+  source        String   @default("")
+  staffId       String?
+  staffName     String   @default("")
+  leadId        String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([gymId, date])
+  @@index([memberId])
+  @@index([gymId, saleType, date])
+  @@index([staffId])
+}
+
+model Expense {
+  id          String   @id @default(uuid())
+  gymId       String
+  title       String
+  amount      Float
+  category    String
+  date        DateTime @default(now())
+  description String?
+  branchId    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([gymId, date])
+  @@index([gymId, branchId, date])
+}
+
+model ExpenseCategory {
+  id        String   @id @default(uuid())
+  gymId     String
+  name      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([gymId, name])
+  @@index([gymId])
+}
+
+model GymClass {
+  id           String   @id @default(uuid())
+  name         String
+  type         String
+  description  String   @default("")
+  trainerName  String   @default("")
+  scheduleDate DateTime
+  startTime    String
+  endTime      String
+  maxSeats     Int      @default(10)
+  isAddOn      Boolean  @default(false)
+  priceCoins   Int      @default(0)
+  gymId        String
+  branchId     String?
+  bookings     String?  // stored as JSON string
+  bookingDeadline DateTime?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([gymId, scheduleDate])
+}
+
+model ClassCoinTransaction {
+  id          String   @id @default(uuid())
+  memberId    String
+  classId     String
+  className   String
+  gymId       String
+  branchId    String?
+  amount      Int
+  direction   String   // DEBIT, REFUND, PARTNER_EARNING, PARTNER_EARNING_REVERSAL
+  createdAt   DateTime @default(now())
+
+  @@index([memberId, createdAt(sort: Desc)])
+  @@index([classId])
+}
+
+model Lead {
+  id                String    @id @default(uuid())
+  name              String
+  phone             String
+  email             String    @default("")
+  source            String    @default("Walk-in")
+  status            String    @default("New")
+  interestedPlan    String    @default("")
+  notes             String    @default("")
+  followUpDate      DateTime?
+  convertedMemberId String?
+  gymId             String
+  branchId          String?
+  assignedTo        String    @default("")
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  communicationPreferences CommunicationPreference[]
+  communicationMessages CommunicationMessage[]
+
+  @@index([gymId, status])
+  @@index([phone])
+}
+
+model CommunicationAutomationRule {
+  id          String   @id @default(uuid())
+  gymId       String
+  gym         Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  name        String
+  trigger     String
+  enabled     Boolean  @default(false)
+  days        Int      @default(2)
+  channel     String   @default("email")
+  subject     String   @default("")
+  message     String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  messages    CommunicationMessage[]
+
+  @@unique([gymId, trigger])
+  @@index([gymId, enabled])
+}
+
+model CommunicationPreference {
+  id             String   @id @default(uuid())
+  gymId          String
+  gym            Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  memberId       String?
+  member         Member?  @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  leadId         String?
+  lead           Lead?    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  emailOptIn     Boolean  @default(false)
+  whatsappOptIn  Boolean  @default(false)
+  consentSource  String   @default("")
+  consentedAt    DateTime?
+  optedOutAt     DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([memberId])
+  @@unique([leadId])
+  @@index([gymId, emailOptIn, whatsappOptIn])
+}
+
+model CommunicationMessage {
+  id             String   @id @default(uuid())
+  gymId          String
+  gym            Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  memberId       String?
+  member         Member?  @relation(fields: [memberId], references: [id], onDelete: SetNull)
+  leadId         String?
+  lead           Lead?    @relation(fields: [leadId], references: [id], onDelete: SetNull)
+  ruleId         String?
+  rule           CommunicationAutomationRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  channel        String
+  recipient      String
+  subject        String   @default("")
+  body           String
+  status         String   @default("pending")
+  dedupeKey      String   @unique
+  providerId     String   @default("")
+  error          String   @default("")
+  attemptCount   Int      @default(0)
+  nextAttemptAt  DateTime @default(now())
+  sentAt         DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([gymId, status, nextAttemptAt])
+  @@index([gymId, createdAt])
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  gymId      String
+  userId     String?
+  userName   String   @default("System")
+  userEmail  String   @default("")
+  userRole   String   @default("")
+  action     String
+  entity     String   @default("")
+  entityId   String   @default("")
+  entityName String   @default("")
+  details    String   @default("")
+  ip         String   @default("")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([gymId, action])
+  @@index([createdAt])
+}
+
+model Branch {
+  id             String   @id @default(uuid())
+  name           String
+  shortDescription String @default("")
+  description    String   @default("")
+  address        String   @default("")
+  phone          String   @default("")
+  email          String   @default("")
+  website        String   @default("")
+  openingTime    String   @default("06:00 AM")
+  closingTime    String   @default("10:00 PM")
+  workingDays    String[] @default(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"])
+  weeklySchedule Json     @default("{}")
+  scheduleExceptions Json @default("[]")
+  amenities      String[] @default([])
+  equipments     String[] @default([])
+  gymId          String
+  managerId      String?
+  managerName    String   @default("")
+  isActive       Boolean  @default(true)
+  fitPassEnabled Boolean  @default(true)
+  latitude       Float?
+  longitude      Float?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([gymId])
+}
+
+model Notification {
+  id          String   @id @default(uuid())
+  recipientId String
+  gymId       String
+  type        String
+  message     String
+  read        Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([recipientId, read])
+  @@index([gymId])
+}
+
+model Ticket {
+  id        String         @id @default(uuid())
+  memberId  String
+  gymId     String
+  subject   String
+  category  String
+  status    String         @default("Open")
+  messages  TicketMessage[]
+  createdAt DateTime       @default(now())
+  updatedAt DateTime       @updatedAt
+
+  @@index([memberId, updatedAt(sort: Desc)])
+  @@index([gymId, updatedAt(sort: Desc)])
+}
+
+model TicketMessage {
+  id        String   @id @default(uuid())
+  ticketId  String
+  ticket    Ticket   @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderId  String
+  senderName String
+  message   String
+  createdAt DateTime @default(now())
+
+  @@index([ticketId, createdAt])
+}
+
+model OTP {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  otp       String
+  expiresAt DateTime
+  // Number of failed verification attempts for this OTP. After MAX_OTP_ATTEMPTS
+  // (see authController) the OTP is invalidated and the user must request a new one.
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+}
+
+model MemberTrainerAssignment {
+  id           String   @id @default(uuid())
+  memberId     String
+  trainerId    String
+  assignedDate DateTime @default(now())
+  gymId        String
+  branchId     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([gymId])
+  @@index([memberId])
+  @@index([trainerId])
+}
+
+model WorkoutTemplate {
+  id           String   @id @default(uuid())
+  name         String
+  description  String?
+  exercises    String?
+  gymId        String
+  branchId     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([gymId, branchId])
+  @@index([gymId, name])
+}
+
+model WorkoutPlan {
+  id           String   @id @default(uuid())
+  memberId     String
+  memberIds    String?  // JSON array: one reusable plan may be assigned to many members
+  trainerId    String?
+  name         String
+  startDate    DateTime?
+  endDate      DateTime?
+  exercises    String?
+  gymId        String
+  branchId     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([gymId, createdAt(sort: Desc)])
+  @@index([memberId])
+  @@index([trainerId])
+}
+
+model IdSequence {
+  key       String   @id
+  value     Int
+  updatedAt DateTime @updatedAt
+}
+
+model DietPlan {
+  id           String   @id @default(uuid())
+  memberId     String
+  memberIds    String?
+  trainerId    String?
+  name         String
+  startDate    DateTime?
+  endDate      DateTime?
+  meals        String?
+  gymId        String
+  branchId     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([gymId, createdAt(sort: Desc)])
+  @@index([memberId])
+  @@index([trainerId])
+}
+
+model NutritionLog {
+  id              String   @id @default(uuid())
+  memberId        String
+  planId          String?
+  trainerId       String?
+  recordedById    String?
+  planName        String   @default("")
+  mealCount       Int      @default(0)
+  completedMeals  Int      @default(0)
+  calories        Float    @default(0)
+  protein         Float    @default(0)
+  carbs           Float    @default(0)
+  fats            Float    @default(0)
+  waterCups       Int      @default(0)
+  notes           String   @default("")
+  loggedAt        DateTime @default(now())
+  gymId           String
+  branchId        String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([gymId, loggedAt])
+  @@index([memberId, loggedAt])
+  @@index([trainerId, loggedAt])
+  @@index([planId])
+}
+
+model WorkoutLog {
+  id                  String   @id @default(uuid())
+  memberId            String
+  planId              String?
+  trainerId           String?
+  recordedById        String?
+  planName            String   @default("")
+  trainingDay         String   @default("")
+  completedExercises  Int      @default(0)
+  totalExercises      Int      @default(0)
+  exercises           String   @default("[]")
+  durationMinutes     Int?
+  notes               String   @default("")
+  loggedAt            DateTime @default(now())
+  gymId               String
+  branchId            String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([gymId, loggedAt])
+  @@index([memberId, loggedAt])
+  @@index([trainerId, loggedAt])
+  @@index([planId])
+}
+
+model DietTemplate {
+  id          String   @id @default(uuid())
+  name        String
+  description String?
+  meals       String?
+  gymId       String
+  branchId    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([gymId, branchId])
+  @@index([gymId, name])
+}
+
+model PtPackage {
+  id           String   @id @default(uuid())
+  name         String
+  description  String?
+  price        Float
+  sessionCount Int
+  duration     Int?
+  gymId        String
+  branchId     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([gymId])
+}
+
+model PtSession {
+  id           String   @id @default(uuid())
+  memberId     String
+  trainerId    String
+  packageId    String?
+  sessionDate  DateTime
+  status       String   @default("Scheduled")
+  notes        String?
+  gymId        String
+  branchId     String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([gymId, sessionDate(sort: Desc)])
+  @@index([memberId])
+  @@index([trainerId])
+}
+
+model BodyAssessment {
+  id             String   @id @default(uuid())
+  memberId       String
+  trainerId      String?
+  weight         Float
+  heightCm       Float?
+  bmi            Float?
+  bodyFat        Float?   // PBF, when recorded by an InBody device
+  muscleMass     Float?   // SMM, when recorded by an InBody device
+  bmr            Float?   // Device reading only; not inferred
+  waistCm        Float?
+  inBodyScore    Float?
+  assessmentDate DateTime @default(now())
+  gymId          String
+  branchId       String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([gymId, assessmentDate(sort: Desc)])
+  @@index([memberId])
+  @@index([trainerId])
+}
+
+model TrainerAttendance {
+  id           String    @id @default(uuid())
+  trainerId    String
+  date         DateTime  @default(now())
+  checkInTime  DateTime  @default(now())
+  checkOutTime DateTime?
+  workingHours Float?
+  status       String    @default("Present")
+  leaveReason  String?
+  gymId        String
+  branchId     String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([gymId, date(sort: Desc)])
+  @@index([trainerId])
+}
+
+model TrainerLeaveRequest {
+  id                 String    @id @default(uuid())
+  trainerId          String
+  startDate          DateTime
+  endDate            DateTime
+  approvedStartDate  DateTime?
+  approvedEndDate    DateTime?
+  reason             String?
+  adminNote          String?
+  status             String    @default("Pending") // Pending, Approved, Rejected
+  reviewedBy         String?
+  reviewedAt         DateTime?
+  gymId              String
+  branchId           String?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([gymId, status, createdAt(sort: Desc)])
+  @@index([trainerId, startDate])
+  @@index([gymId, branchId, startDate, endDate])
+}
+
+model TrainerSalary {
+  id           String    @id @default(uuid())
+  trainerId    String    @unique
+  fixedSalary  Float     @default(0)
+  commissionPt Float     @default(0) // Rate per PT session
+  salesAmountPerPoint Float @default(1000)
+  incentivePerPoint Float @default(0)
+  gymId        String
+  branchId     String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([gymId, trainerId])
+}
+
+model PtCommission {
+  id           String    @id @default(uuid())
+  trainerId    String
+  sessionId    String?   // PtSession reference
+  amount       Float
+  date         DateTime  @default(now())
+  gymId        String
+  branchId     String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([gymId, date(sort: Desc)])
+  @@index([trainerId])
+}
+
+model Payroll {
+  id           String    @id @default(uuid())
+  trainerId    String
+  month        Int       // 1 to 12
+  year         Int
+  fixedSalary  Float     @default(0)
+  commissions  Float     @default(0)
+  salesPoints  Int       @default(0)
+  salesIncentive Float   @default(0)
+  incentives   Float     @default(0)
+  totalAmount  Float
+  status       String    @default("Pending") // Pending, Paid
+  paymentDate  DateTime?
+  gymId        String
+  branchId     String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([gymId, year, month])
+  @@index([trainerId])
+}
+
+
+model Equipment {
+  id           String    @id @default(uuid())
+  name         String
+  brand        String    @default("")
+  status       String    @default("Functional")
+  purchaseDate DateTime  @default(now())
+  gymId        String
+  branchId     String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@index([gymId, status])
+}
+
+model MaintenanceLog {
+  id               String    @id @default(uuid())
+  equipmentId      String?
+  equipmentName    String    @default("")
+  issueDescription String    @default("")
+  status           String    @default("In Progress")
+  cost             Float     @default(0)
+  loggedDate       DateTime  @default(now())
+  gymId            String
+  branchId         String?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  @@index([gymId, loggedDate])
+}
+
+model Review {
+  id         String   @id @default(uuid())
+  gymId      String
+  memberId   String
+  memberName String   @default("Verified Member")
+  rating     Int      @default(5)
+  comment    String   @default("")
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([gymId])
+  @@index([memberId])
+  @@index([gymId, memberId])
+}
+
+model GymProfile {
+  id                    String   @id @default(uuid())
+  gymId                 String   @unique
+  gym                   Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  
+  // Basic info & branding
+  shortDescription      String?  @default("")
+  description           String?  @default("")
+  coverImageUrl         String?  @default("")
+  logoUrl               String?  @default("")
+  ownerName             String?  @default("")
+  contactNumber         String?  @default("")
+  email                 String?  @default("")
+  website               String?  @default("")
+  
+  // Location & Geo
+  address               String?  @default("")
+  city                  String   @default("Chennai")
+  googleMapsUrl         String?  @default("")
+  latitude              Float?   @default(13.0827)
+  longitude             Float?   @default(80.2707)
+  landmarks             String[] @default([])
+  
+  // Working Hours & Schedule
+  openingTime           String   @default("06:00 AM")
+  closingTime           String   @default("10:00 PM")
+  workingDays           String[] @default(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"])
+  timeZone              String   @default("Asia/Kolkata")
+  weeklySchedule        Json     @default("{}")
+  scheduleExceptions    Json     @default("[]")
+  
+  // Facilities & Badges (Booleans)
+  hasParking            Boolean  @default(true)
+  hasLockers            Boolean  @default(true)
+  hasShowers            Boolean  @default(true)
+  hasPersonalTraining   Boolean  @default(true)
+  hasGroupClasses       Boolean  @default(true)
+  isWomenFriendly       Boolean  @default(true)
+  isAc                  Boolean  @default(true)
+  
+  // Extra Amenities & Equipment list
+  amenities             String[] @default(["Free WiFi", "Locker Room", "Air Conditioned", "Showers", "Steam Bath"])
+  equipments            String[] @default(["Treadmills", "Dumbbells", "Power Racks", "Cable Crossover", "Leg Press"])
+  
+  // Social links
+  instagram             String?  @default("")
+  facebook              String?  @default("")
+  youtube               String?  @default("")
+  
+  // Verification & Status Workflow
+  status                String   @default("Approved") // "Draft" | "Pending Review" | "Approved" | "Rejected" | "Archived"
+  rejectionReason       String?  @default("")
+  isVerified            Boolean  @default(true)
+  
+  // Rating & Real-time Metrics
+  rating                Float    @default(4.8)
+  reviewCount           Int      @default(24)
+  viewCount             Int      @default(0)
+  
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([city])
+  @@index([status])
+  @@index([gymId])
+}
+
+model GymPost {
+  id                    String   @id @default(uuid())
+  gymId                 String
+  gym                   Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  title                 String
+  caption               String?  @default("")
+  description           String?  @default("")
+  images                String[] @default([])
+  videoUrl              String?  @default("")
+  
+  // Workflow Status
+  status                String   @default("Approved") // "Draft" | "Pending Review" | "Approved" | "Rejected" | "Archived"
+  rejectionReason       String?  @default("")
+  
+  // Stats
+  viewsCount            Int      @default(0)
+  
+  // Author metadata
+  createdById           String?
+  createdByName         String   @default("Gym Admin")
+  
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  @@index([gymId, status])
+  @@index([createdAt(sort: Desc)])
+}
+
+model StoreProduct {
+  id          String   @id @default(uuid())
+  name        String
+  description String   @default("")
+  priceCoins  Int
+  imageUrl    String   @default("")
+  division    String   @default("fitpass")
+  isActive    Boolean  @default(true)
+  stock       Int?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([division, isActive])
+}
+
+model StoreOrder {
+  id          String   @id @default(uuid())
+  memberId    String
+  productId   String
+  productName String
+  division    String
+  coinsSpent  Int
+  status      String   @default("RECEIVED")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @default(now()) @updatedAt
+
+  @@index([memberId, createdAt])
+  @@index([division, status, createdAt])
+}
+
+model CoinSettings {
+  id              String   @id @default(uuid())
+  division        String   @unique
+  coinsPerSession Int      @default(10)
+  updatedAt       DateTime @updatedAt
+}
+
+model GymProfileViewLog {
+  id                    String   @id @default(uuid())
+  gymId                 String
+  memberId              String?
+  source                String   @default("explore")
+  viewedAt              DateTime @default(now())
+
+  @@index([gymId, viewedAt])
+}

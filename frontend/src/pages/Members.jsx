@@ -1,0 +1,1861 @@
+import { useState, useEffect, useContext, useRef } from 'react';
+import { useNavigate, useLocation } from 'react-router-dom';
+import { getMembers, getPlans, createMember, updateMember, deleteMember, getMemberAuditTrail } from '../services/apiService';
+import Modal from '../components/Modal';
+import ResetFiltersButton from '../components/ResetFiltersButton';
+import { AuthContext } from '../context/AuthContext';
+import { QRCodeCanvas } from 'qrcode.react';
+import API from '../services/api';
+import { Loader,  Pencil, Trash2, Smartphone, FileText, RefreshCw, ArrowRightLeft, Download } from 'lucide-react';
+
+const planCoinAllowance = (plan, coinsPerCheckIn) => Number(plan?.coinAllowance) > 0
+    ? Number(plan.coinAllowance)
+    : Number(plan?.sessions || 0) * coinsPerCheckIn;
+const planDurationDays = (plan) => {
+    const duration = Number(plan?.duration) || 0;
+    const unit = String(plan?.durationUnit || 'days').toLowerCase();
+    if (unit.startsWith('month')) return duration * 30;
+    if (unit.startsWith('year')) return duration * 365;
+    if (unit.startsWith('hour')) return duration / 24;
+    return duration;
+};
+const planDailyValue = (plan) => Number(plan?.price) > 0 && planDurationDays(plan) > 0
+    ? Number(plan.price) / planDurationDays(plan)
+    : 0;
+const estimateCoinsPerH4Day = (sourceDivision, sourcePlan, sourcePlanPrice, targetPlan, coinsPerCheckIn, fallback) => {
+    if (sourceDivision === 'fitpass') {
+        const allowance = planCoinAllowance(sourcePlan, coinsPerCheckIn);
+        const coinValue = allowance > 0 ? Number(sourcePlanPrice || sourcePlan?.price || 0) / allowance : 0;
+        const dailyValue = planDailyValue(targetPlan);
+        return coinValue > 0 && dailyValue > 0 ? Number((dailyValue / coinValue).toFixed(2)) : fallback;
+    }
+    const dailyValue = Number(sourcePlanPrice || sourcePlan?.price || 0) / (planDurationDays(sourcePlan) || 30);
+    const targetAllowance = planCoinAllowance(targetPlan, coinsPerCheckIn);
+    const coinValue = targetAllowance > 0 ? Number(targetPlan?.price || 0) / targetAllowance : 0;
+    return dailyValue > 0 && coinValue > 0 ? Number((dailyValue / coinValue).toFixed(2)) : fallback;
+};
+
+const Members = () => {
+    const navigate = useNavigate();
+    const location = useLocation();
+    const { user, selectedGymId, selectedBranchId, activeDivision } = useContext(AuthContext);
+    const isH4Context = activeDivision === 'h4' || ['05a08fdf-7427-48a5-8b25-e18d5a5668cd', '327d37e7-f978-43a9-82ef-e6c4a4dc3c5d'].includes(String(selectedGymId || user?.gymId || ''));
+    const [members, setMembers] = useState([]);
+    const fetchRequestRef = useRef(0);
+    const [plans, setPlans] = useState([]);
+    const [loading, setLoading] = useState(true);
+    const [searchTerm, setSearchTerm] = useState('');
+    const [statusFilter, setStatusFilter] = useState('');
+    const [page, setPage] = useState(1);
+    const [pages, setPages] = useState(1);
+    const [isModalOpen, setIsModalOpen] = useState(false);
+    const [isQRModalOpen, setIsQRModalOpen] = useState(false);
+    const [viewingQRMember, setViewingQRMember] = useState(null);
+    const [editingMember, setEditingMember] = useState(null);
+    const [branches, setBranches] = useState([]);
+    const [branchFilter, setBranchFilter] = useState('');
+    const [formData, setFormData] = useState({ name: '', phone: '', email: '', planId: '', joinDate: '', branchId: '', gymId: '', password: '', durationPreset: '30', durationDays: '30', saleSource: '', salesStaffId: '' });
+    const [salesStaff, setSalesStaff] = useState([]);
+    const [wizardStep, setWizardStep] = useState(1);
+    const [questionnaire, setQuestionnaire] = useState({
+        fitnessGoal: 'Fat Loss',
+        experienceLevel: 'Beginner',
+        workoutFrequency: '3-4 Days / Week',
+        dietPreference: 'Vegetarian',
+        medicalHistory: '',
+        emergencyContactName: '',
+        emergencyContactPhone: '',
+        specialNotes: ''
+    });
+    const [highlightId, setHighlightId] = useState(null);
+    const highlightRef = useRef(null);
+    const [convertingLeadId, setConvertingLeadId] = useState(null);
+    const appliedConvertLeadRef = useRef(null);
+    const pendingInterestedPlanRef = useRef('');
+
+    // Renew & Transfer states
+    const [renewMemberData, setRenewMemberData] = useState(null);
+    const [renewForm, setRenewForm] = useState({ planId: '', paidAmount: '', method: 'Cash' });
+    const [transferMemberData, setTransferMemberData] = useState(null);
+    const [transferBranchId, setTransferBranchId] = useState('');
+    const [submittingAction, setSubmittingAction] = useState(false);
+    const [divisionConversion, setDivisionConversion] = useState(null);
+    const [loadingConversion, setLoadingConversion] = useState(false);
+
+
+    const [gyms, setGyms] = useState([]);
+    const [isAuditModalOpen, setIsAuditModalOpen] = useState(false);
+    const [auditData, setAuditData] = useState(null);
+    const [loadingAudit, setLoadingAudit] = useState(false);
+    const [isExporting, setIsExporting] = useState(false);
+
+    // Read URL params from global search
+    useEffect(() => {
+        API.get('/staff').then(({ data }) => setSalesStaff(Array.isArray(data) ? data : [])).catch(() => setSalesStaff([]));
+    }, []);
+
+    useEffect(() => {
+        const params = new URLSearchParams(location.search);
+        const searchParam = params.get('search');
+        const highlightParam = params.get('highlight');
+        if (searchParam) setSearchTerm(searchParam);
+        if (highlightParam) setHighlightId(highlightParam);
+    }, [location.search]);
+
+    // Convert a Lead into a Member: open the Add Member modal pre-filled with
+    // whatever the lead already captured (see Leads.jsx -> convertToMember).
+    useEffect(() => {
+        const params = new URLSearchParams(location.search);
+        const convertLeadId = params.get('convertLeadId');
+        if (!convertLeadId || appliedConvertLeadRef.current === convertLeadId) return;
+        appliedConvertLeadRef.current = convertLeadId;
+
+        const leadName = params.get('name') || '';
+        const leadPhone = params.get('phone') || '';
+        const leadEmail = params.get('email') || '';
+        const leadGymId = params.get('gymId') || '';
+        const leadBranchId = params.get('branchId') || '';
+        const leadInterestedPlan = params.get('interestedPlan') || '';
+        const leadSource = params.get('source') || '';
+        const leadAssignedTo = params.get('assignedTo') || '';
+
+        setEditingMember(null);
+        setFormData({
+            name: leadName,
+            phone: leadPhone,
+            email: leadEmail,
+            planId: '',
+            joinDate: new Date().toISOString().split('T')[0],
+            branchId: leadBranchId || user?.branchId || '',
+            gymId: leadGymId || '',
+            password: '',
+            durationPreset: '30',
+            durationDays: '30',
+            saleSource: leadSource,
+            salesStaffId: leadAssignedTo
+        });
+        setConvertingLeadId(convertLeadId);
+        setIsModalOpen(true);
+        // Stash for the plan-matching effect below — `plans` may not be loaded yet.
+        pendingInterestedPlanRef.current = leadInterestedPlan;
+
+        // Clear the query string so a refresh doesn't reopen/reapply the pre-fill.
+        navigate(location.pathname, { replace: true });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [location.search]);
+
+    // Best-effort match of a converting lead's free-text "interested plan" to a
+    // real Plan by name, once the plans list has actually loaded.
+    useEffect(() => {
+        const leadInterestedPlan = pendingInterestedPlanRef.current;
+        if (!leadInterestedPlan || !convertingLeadId || plans.length === 0) return;
+        const matchedPlan = plans.find(p => p.name?.trim().toLowerCase() === leadInterestedPlan.trim().toLowerCase());
+        if (matchedPlan) {
+            setFormData(prev => ({ ...prev, planId: matchedPlan._id }));
+        }
+        pendingInterestedPlanRef.current = '';
+    }, [plans, convertingLeadId]);
+
+    // Scroll to highlighted member
+    useEffect(() => {
+        if (highlightId && highlightRef.current) {
+            highlightRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            setTimeout(() => setHighlightId(null), 3000);
+        }
+    }, [highlightId, members]);
+
+    useEffect(() => {
+        fetchData();
+    }, [page, statusFilter, searchTerm]);
+
+    useEffect(() => {
+        // A branch or gym can have fewer pages than the previous scope.
+        // Reset pagination so the directory does not request an empty page.
+        if (page === 1) {
+            fetchData();
+        } else {
+            setPage(1);
+        }
+    }, [selectedGymId, selectedBranchId]);
+
+    const fetchData = async () => {
+        const requestId = ++fetchRequestRef.current;
+        try {
+            // Load the directory independently so a plans/branches request
+            // failure cannot leave a valid members response hidden.
+            const membersData = await getMembers(statusFilter, page, searchTerm);
+            if (requestId !== fetchRequestRef.current) return;
+            setMembers(membersData.members || []);
+            setPages(membersData.pages || 1);
+        } catch (error) {
+            if (requestId !== fetchRequestRef.current) return;
+            console.error('Error fetching members:', error);
+            setMembers([]);
+            setPages(1);
+        }
+
+        try {
+            const [plansResult, branchesResult, h4GymResult] = await Promise.allSettled([
+                getPlans(),
+                API.get('/branches'),
+                user?.role === 'superadmin' || user?.role === 'fitpass_admin'
+                    ? API.get('/superadmin/h4-gym').catch(() => ({ data: null }))
+                    : Promise.resolve({ data: null })
+            ]);
+            if (requestId !== fetchRequestRef.current) return;
+            if (plansResult.status === 'fulfilled') {
+                setPlans(Array.isArray(plansResult.value) ? plansResult.value : []);
+            } else {
+                console.error('Error fetching membership plans:', plansResult.reason);
+            }
+            const branchList = branchesResult.status === 'fulfilled' ? (branchesResult.value.data || []) : [];
+            if (branchesResult.status === 'rejected') {
+                console.error('Error fetching branches for member form:', branchesResult.reason);
+            }
+            const h4GymData = h4GymResult.status === 'fulfilled' ? h4GymResult.value.data : null;
+            const activeH4GymId = h4GymData?._id || h4GymData?.id || (isH4Context ? selectedGymId : '');
+            const h4GymIds = new Set((activeH4GymId
+                ? [activeH4GymId]
+                : ['05a08fdf-7427-48a5-8b25-e18d5a5668cd', '327d37e7-f978-43a9-82ef-e6c4a4dc3c5d']
+            ).filter(Boolean).map(String));
+            setBranches(isH4Context ? branchList.filter(b => h4GymIds.has(String(b.gymId?._id || b.gymId?.id || b.gymId || ''))) : branchList);
+
+            if (user?.role === 'superadmin' || user?.role === 'fitpass_admin') {
+                const gymsRes = await API.get('/superadmin/gyms');
+                // Include H4 gym in the list so superadmin can switch to it!
+                const list = gymsRes.data || [];
+                const h4GymId = h4GymData?._id || h4GymData?.id;
+                const hasH4 = list.some(g => g.name === 'H4' || (g._id || g.id) === h4GymId);
+                if (!hasH4 && h4GymData) {
+                    list.unshift(h4GymData);
+                }
+                setGyms(list);
+            }
+        } catch (error) {
+            if (requestId !== fetchRequestRef.current) return;
+            console.error('Error fetching member directory supporting data:', error);
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        setPage(1);
+    }, [statusFilter]);
+
+    const handleOpenModal = (member = null) => {
+        setConvertingLeadId(null);
+        if (member) {
+            setEditingMember(member);
+            setFormData({
+                name: member.name,
+                phone: member.phone,
+                email: member.email || '',
+                planId: member.planId?._id || '',
+                joinDate: member.joinDate ? member.joinDate.split('T')[0] : '',
+                branchId: member.branchId?._id || member.branchId || '',
+                gymId: member.gymId?._id || member.gymId || '',
+                password: '',
+                durationPreset: '30',
+                durationDays: '30'
+            });
+        } else {
+            setEditingMember(null);
+            setFormData({ name: '', phone: '', email: '', planId: '', joinDate: new Date().toISOString().split('T')[0], branchId: user?.branchId || '', gymId: '', password: '', durationPreset: '30', durationDays: '30' });
+        }
+        setIsModalOpen(true);
+    };
+
+    const handleOpenAudit = async (member) => {
+        setLoadingAudit(true);
+        setIsAuditModalOpen(true);
+        setAuditData(null);
+        try {
+            const data = await getMemberAuditTrail(member._id);
+            setAuditData(data);
+        } catch {
+            alert('Failed to load member audit trail');
+            setIsAuditModalOpen(false);
+        } finally {
+            setLoadingAudit(false);
+        }
+    };
+
+    const handleOpenDivisionConversion = async (member) => {
+        setLoadingConversion(true);
+        setDivisionConversion({ member, loading: true });
+        try {
+            const { data: options } = await API.get(`/members/${member._id}/division-conversion`);
+            const targetDivision = options.sourceDivision === 'fitpass' ? 'h4' : 'fitpass';
+            const targetPlans = targetDivision === 'h4' ? options.h4Plans : options.fitpassPlans;
+            const targetPlan = targetPlans[0];
+            const sourceAmount = options.sourceDivision === 'fitpass' ? options.fitpassCoinBalance : options.h4DaysRemaining;
+            const rate = estimateCoinsPerH4Day(
+                options.sourceDivision,
+                options.sourcePlan,
+                options.sourcePlanPrice,
+                targetPlan,
+                options.coinsPerCheckIn,
+                options.suggestedCoinsPerH4Day
+            );
+            const roundedRate = Math.max(0.01, Number(rate || options.suggestedCoinsPerH4Day).toFixed(2));
+            const targetAmount = options.sourceDivision === 'fitpass'
+                ? Math.round(sourceAmount / roundedRate)
+                : Math.round(sourceAmount * roundedRate);
+            setDivisionConversion({
+                member,
+                options,
+                targetDivision,
+                targetPlanId: targetPlan?.id || '',
+                targetBranchId: options.h4Branches.find(branch => String(branch.id) === String(member.branchId || ''))?.id || '',
+                sourceAmount: String(sourceAmount),
+                targetAmount: String(targetAmount),
+                coinsPerH4Day: String(roundedRate),
+            });
+        } catch (error) {
+            setDivisionConversion(null);
+            alert(error.response?.data?.message || 'Could not load conversion details.');
+        } finally {
+            setLoadingConversion(false);
+        }
+    };
+
+    const updateConversionSource = (sourceAmount) => {
+        setDivisionConversion(current => {
+            if (!current?.options) return current;
+            const amount = Number(sourceAmount) || 0;
+            const rate = Number(current.coinsPerH4Day) || 0;
+            const targetAmount = rate > 0 ? current.options.sourceDivision === 'fitpass'
+                ? Math.round(amount / rate)
+                : Math.round(amount * rate) : 0;
+            return { ...current, sourceAmount, targetAmount: String(targetAmount) };
+        });
+    };
+
+    const updateConversionTarget = (targetAmount) => {
+        setDivisionConversion(current => {
+            if (!current?.options) return current;
+            const amount = Number(targetAmount) || 0;
+            const rate = Number(current.coinsPerH4Day) || 0;
+            const sourceAmount = rate > 0 ? current.options.sourceDivision === 'fitpass'
+                ? Math.round(amount * rate)
+                : Math.round(amount / rate) : 0;
+            const roundedTarget = rate > 0 ? current.options.sourceDivision === 'fitpass'
+                ? Math.round(sourceAmount / rate)
+                : Math.round(sourceAmount * rate) : 0;
+            return { ...current, targetAmount: String(roundedTarget), sourceAmount: String(sourceAmount) };
+        });
+    };
+
+    const updateConversionRate = (coinsPerH4Day) => {
+        setDivisionConversion(current => {
+            if (!current?.options) return current;
+            const rate = Number(coinsPerH4Day) || 0;
+            const sourceAmount = Number(current.sourceAmount) || 0;
+            const targetAmount = rate > 0 ? current.options.sourceDivision === 'fitpass'
+                ? Math.round(sourceAmount / rate)
+                : Math.round(sourceAmount * rate) : 0;
+            return { ...current, coinsPerH4Day, targetAmount: String(targetAmount) };
+        });
+    };
+
+    const updateConversionPlan = (targetPlanId) => {
+        setDivisionConversion(current => {
+            if (!current?.options) return current;
+            const targetPlans = current.targetDivision === 'h4' ? current.options.h4Plans : current.options.fitpassPlans;
+            const targetPlan = targetPlans.find(plan => String(plan.id) === String(targetPlanId));
+            const rate = estimateCoinsPerH4Day(
+                current.options.sourceDivision,
+                current.options.sourcePlan,
+                current.options.sourcePlanPrice,
+                targetPlan,
+                current.options.coinsPerCheckIn,
+                current.options.suggestedCoinsPerH4Day
+            );
+            const roundedRate = Math.max(0.01, Number(rate || current.options.suggestedCoinsPerH4Day).toFixed(2));
+            const sourceAmount = Number(current.sourceAmount) || 0;
+            const targetAmount = current.options.sourceDivision === 'fitpass'
+                ? Math.round(sourceAmount / roundedRate)
+                : Math.round(sourceAmount * roundedRate);
+            return { ...current, targetPlanId, coinsPerH4Day: String(roundedRate), targetAmount: String(targetAmount) };
+        });
+    };
+
+    const handleConvertDivision = async (event) => {
+        event.preventDefault();
+        if (!divisionConversion?.options) return;
+        const { member, options, targetDivision, targetPlanId, targetBranchId, sourceAmount, targetAmount, coinsPerH4Day } = divisionConversion;
+        if (!targetPlanId || Number(sourceAmount) <= 0 || Number(targetAmount) <= 0 || Number(coinsPerH4Day) <= 0) {
+            alert('Enter valid amounts, a conversion rate, and a target plan.');
+            return;
+        }
+        const maximum = options.sourceDivision === 'fitpass' ? options.fitpassCoinBalance : options.h4DaysRemaining;
+        const remainder = Math.max(0, maximum - Number(sourceAmount));
+        const remainderWarning = remainder > 0
+            ? options.sourceDivision === 'fitpass'
+                ? `\n${remainder} unconverted FitCoins will remain on the H4 member profile and cannot be spent until they are converted back to FitPass.`
+                : `\n${remainder} H4 day(s) not included in this conversion will not carry over.`
+            : '';
+        if (!window.confirm(`Convert ${member.name} from ${options.sourceDivision.toUpperCase()} to ${targetDivision.toUpperCase()}?\n${sourceAmount} ${options.sourceDivision === 'fitpass' ? 'FitCoins' : 'H4 days'} → ${targetAmount} ${targetDivision === 'fitpass' ? 'FitCoins' : 'H4 days'} at ${coinsPerH4Day} FitCoins per H4 day.${remainderWarning}`)) return;
+
+        setSubmittingAction(true);
+        try {
+            await API.post(`/members/${member._id}/division-conversion`, {
+                targetDivision,
+                targetPlanId,
+                targetBranchId: targetDivision === 'h4' ? targetBranchId || null : null,
+                sourceAmount: Number(sourceAmount),
+                coinsPerH4Day: Number(coinsPerH4Day),
+            });
+            setDivisionConversion(null);
+            fetchData();
+        } catch (error) {
+            alert(error.response?.data?.message || 'Member conversion failed.');
+        } finally {
+            setSubmittingAction(false);
+        }
+    };
+
+    const handleDownloadQR = () => {
+        const canvas = document.getElementById('member-qr');
+        const url = canvas.toDataURL("image/png");
+        const link = document.createElement('a');
+        link.download = `QR - ${viewingQRMember.name}.png`;
+        link.href = url;
+        link.click();
+    };
+
+    const handleSubmit = async (e) => {
+        if (e) e.preventDefault();
+        try {
+            if (editingMember) {
+                await updateMember(editingMember._id, formData);
+                alert(` Member "${formData.name}" details updated successfully.`);
+            } else {
+                const newMember = await createMember({ ...formData, leadId: convertingLeadId || undefined, questionnaire });
+                if (convertingLeadId) {
+                    try {
+                        await API.put(`/leads/${convertingLeadId}`, {
+                            status: 'Converted',
+                            convertedMemberId: newMember._id
+                        });
+                    } catch (leadError) {
+                        console.error('Member created, but failed to mark lead as converted:', leadError);
+                    }
+                    setConvertingLeadId(null);
+                }
+                alert(` Member "${formData.name}" registered successfully!`);
+                if (newMember?._id) {
+                    setHighlightId(newMember._id);
+                }
+            }
+            fetchData();
+            setIsModalOpen(false);
+            setWizardStep(1);
+            setFormData({
+                name: '',
+                phone: '',
+                email: '',
+                planId: '',
+                joinDate: new Date().toISOString().split('T')[0],
+                branchId: user?.branchId || '',
+                gymId: '',
+                password: '',
+                durationPreset: '30',
+                durationDays: '30',
+                discount: 0,
+                paidAmount: '',
+                paymentMethod: 'Cash'
+            });
+        } catch (error) {
+            alert(error.response?.data?.message || 'Error saving member');
+        }
+    };
+
+    const handleDelete = async (id) => {
+        if (window.confirm('Are you sure you want to delete this member?')) {
+            try {
+                await deleteMember(id);
+                fetchData();
+            } catch {
+                alert('Error deleting member');
+            }
+        }
+    };
+
+    const filteredMembers = members.filter(m => {
+        const matchBranch = !branchFilter || (m.branchId?._id || m.branchId || '') === branchFilter;
+        return matchBranch;
+    });
+    const isConvertibleMember = (member) => {
+        if (user?.role !== 'superadmin') return false;
+        const gymId = String(member.gymId?._id || member.gymId?.id || member.gymId || '');
+        return gymId === 'SYSTEM'
+            || ['05a08fdf-7427-48a5-8b25-e18d5a5668cd', '327d37e7-f978-43a9-82ef-e6c4a4dc3c5d'].includes(gymId)
+            || gyms.some(gym => String(gym._id || gym.id) === gymId && String(gym.name || '').toLowerCase() === 'h4');
+    };
+
+    const handleDownloadCSV = async (exportFullRoster = false) => {
+        setIsExporting(true);
+        try {
+            let exportData = filteredMembers;
+
+            // If user requests full roster export, fetch all members from backend without pagination limits
+            if (exportFullRoster) {
+                const fullRes = await getMembers(statusFilter, 1, searchTerm, 10000);
+                if (fullRes?.members && Array.isArray(fullRes.members)) {
+                    exportData = fullRes.members.filter(m => {
+                        const matchBranch = !branchFilter || (m.branchId?._id || m.branchId || '') === branchFilter;
+                        return matchBranch;
+                    });
+                }
+            }
+
+            if (!exportData || exportData.length === 0) {
+                alert('No member records available for export.');
+                return;
+            }
+
+            const headers = [
+                'Member ID',
+                'Full Name',
+                'Phone Number',
+                'Email Address',
+                'Membership Status',
+                'Plan Name',
+                'Plan Total Price (INR)',
+                'Amount Paid (INR)',
+                'Pending Balance (INR)',
+                'Payment Status',
+                'Home Branch',
+                'Gym / Tenant ID',
+                'Join Date',
+                'Expiry Date',
+                'Days Remaining / Overdue',
+                'Total Sessions Granted',
+                'Sessions Remaining',
+                'Sessions Used',
+                'Last Check-In Time',
+                'Is Account Frozen',
+                'Member Registered At',
+                'Last Updated At'
+            ];
+
+            const now = new Date();
+
+            const rows = exportData.map(m => {
+                const branchObj = branches.find(b => b._id === (m.branchId?._id || m.branchId));
+                const branchName = branchObj ? branchObj.name : (m.branchId?.name || 'Main Branch');
+                const planName = m.planId?.name || 'N/A';
+                const planPrice = Number(m.planPrice || m.planId?.price || 0);
+                const paidAmount = Number(m.paidAmount || 0);
+                const dueAmount = Math.max(0, planPrice - paidAmount);
+                
+                let paymentStatus = 'Paid in Full';
+                if (paidAmount === 0 && planPrice > 0) {
+                    paymentStatus = 'Unpaid';
+                } else if (dueAmount > 0) {
+                    paymentStatus = `Partial Due (₹${dueAmount.toLocaleString('en-IN')})`;
+                }
+
+                const joinDateStr = m.joinDate ? new Date(m.joinDate).toISOString().slice(0, 10) : 'N/A';
+                const expiryDateStr = m.expiryDate ? new Date(m.expiryDate).toISOString().slice(0, 10) : 'N/A';
+                
+                let daysLeftStr = 'N/A';
+                if (m.expiryDate) {
+                    const exp = new Date(m.expiryDate);
+                    const diffTime = exp.getTime() - now.getTime();
+                    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                    if (diffDays > 0) {
+                        daysLeftStr = `${diffDays} Days Active`;
+                    } else if (diffDays === 0) {
+                        daysLeftStr = 'Expires Today';
+                    } else {
+                        daysLeftStr = `${Math.abs(diffDays)} Days Overdue`;
+                    }
+                }
+
+                const sessionsTotal = Number(m.sessionsTotal || 0);
+                const sessionsRemaining = Number(m.sessionsRemaining || 0);
+                const sessionsUsed = Math.max(0, sessionsTotal - sessionsRemaining);
+
+                const lastCheckInStr = m.lastCheckInAt ? new Date(m.lastCheckInAt).toLocaleString('en-IN') : 'No check-ins logged';
+                const isFrozenStr = m.status === 'Frozen' ? 'Yes (Frozen)' : 'No';
+                const createdAtStr = m.createdAt ? new Date(m.createdAt).toLocaleString('en-IN') : 'N/A';
+                const updatedAtStr = m.updatedAt ? new Date(m.updatedAt).toLocaleString('en-IN') : 'N/A';
+
+                return [
+                    `"${(m._id || m.id || '').toString().replace(/"/g, '""')}"`,
+                    `"${(m.name || '').replace(/"/g, '""')}"`,
+                    `"${(m.phone || '').replace(/"/g, '""')}"`,
+                    `"${(m.email || 'N/A').replace(/"/g, '""')}"`,
+                    `"${(m.status || 'Active').replace(/"/g, '""')}"`,
+                    `"${planName.replace(/"/g, '""')}"`,
+                    planPrice,
+                    paidAmount,
+                    dueAmount,
+                    `"${paymentStatus.replace(/"/g, '""')}"`,
+                    `"${branchName.replace(/"/g, '""')}"`,
+                    `"${(m.gymId || 'Default').replace(/"/g, '""')}"`,
+                    `"${joinDateStr}"`,
+                    `"${expiryDateStr}"`,
+                    `"${daysLeftStr}"`,
+                    sessionsTotal,
+                    sessionsRemaining,
+                    sessionsUsed,
+                    `"${lastCheckInStr.replace(/"/g, '""')}"`,
+                    `"${isFrozenStr}"`,
+                    `"${createdAtStr.replace(/"/g, '""')}"`,
+                    `"${updatedAtStr.replace(/"/g, '""')}"`
+                ];
+            });
+
+            const csvContent = '\uFEFF' + [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            const todayStr = new Date().toISOString().slice(0, 10);
+            const exportTypeStr = exportFullRoster ? 'Full_Roster' : 'Filtered_View';
+            link.href = url;
+            link.setAttribute('download', `Gym_Members_Detailed_${exportTypeStr}_${todayStr}.csv`);
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        } catch (error) {
+            console.error('Failed to export CSV:', error);
+            alert('Failed to generate CSV export. Please try again.');
+        } finally {
+            setIsExporting(false);
+        }
+    };
+
+    if (loading) return (
+        <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', height: '60vh' }}>
+            <Loader className="spinner" size={40} style={{ color: 'var(--primary-color)' }} />
+        </div>
+    );
+    return (
+        <div>
+            <div className="page-header" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: '1rem' }}>
+                <div>
+                    <h2 style={{ margin: 0 }}>Members Management</h2>
+                    <p style={{ margin: '0.2rem 0 0', fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Manage member profiles, subscriptions, and download detailed reports</p>
+                </div>
+                <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                    <div style={{ display: 'flex', background: 'var(--bg-secondary, #2D251C)', border: '1px solid var(--border-color, #3A3025)', borderRadius: '8px', overflow: 'hidden' }}>
+                        <button
+                            className="btn"
+                            onClick={() => handleDownloadCSV(false)}
+                            disabled={isExporting}
+                            style={{
+                                display: 'flex', alignItems: 'center', gap: '0.4rem',
+                                padding: '0.5rem 0.85rem', background: 'transparent',
+                                border: 'none', color: '#3B3000', fontWeight: 700,
+                                cursor: isExporting ? 'wait' : 'pointer'
+                            }}
+                            title="Export currently filtered view to CSV"
+                        >
+                            <Download size={16} /> {isExporting ? 'Exporting...' : 'Export Filtered'}
+                        </button>
+                        <div style={{ width: '1px', background: 'var(--border-color, #3A3025)' }} />
+                        <button
+                            className="btn"
+                            onClick={() => handleDownloadCSV(true)}
+                            disabled={isExporting}
+                            style={{
+                                display: 'flex', alignItems: 'center', gap: '0.4rem',
+                                padding: '0.5rem 0.85rem', background: 'rgba(240, 160, 32, 0.12)',
+                                border: 'none', color: '#3B3000', fontWeight: 800,
+                                cursor: isExporting ? 'wait' : 'pointer'
+                            }}
+                            title="Export entire member database to CSV"
+                        >
+                            Export Full Database
+                        </button>
+                    </div>
+                    <button className="btn btn-primary" onClick={() => handleOpenModal()}>+ Add New Member</button>
+                </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: '1rem', marginBottom: '1.5rem', flexWrap: 'wrap' }}>
+                <input
+                    className="input"
+                    style={{ flex: '1', minWidth: '200px' }}
+                    placeholder="Search by member ID (MEM1001), name, or phone..."
+                    value={searchTerm}
+                    onChange={(e) => { setPage(1); setSearchTerm(e.target.value); }}
+                />
+                <select
+                    className="input"
+                    style={{ flex: '1', minWidth: '150px' }}
+                    value={statusFilter}
+                    onChange={(e) => setStatusFilter(e.target.value)}
+                >
+                    <option value="">All Status</option>
+                    <option value="Active">Active</option>
+                    <option value="Expired">Expired</option>
+                    <option value="Frozen"> Frozen</option>
+                </select>
+                {!isH4Context && !user?.branchId && branches.length > 0 && (
+                    <select
+                        className="input"
+                        style={{ flex: '1', minWidth: '150px' }}
+                        value={branchFilter}
+                        onChange={(e) => setBranchFilter(e.target.value)}
+                    >
+                        <option value="">All Branches</option>
+                        {branches.map(b => <option key={b._id} value={b._id}> {b.name}</option>)}
+                    </select>
+                )}
+                <ResetFiltersButton onClick={() => { setSearchTerm(''); setStatusFilter(''); setBranchFilter(''); setPage(1); }} />
+            </div>
+
+            <div className="table-container">
+
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Member ID</th>
+                            <th>Member</th>
+                            <th className="hide-mobile">Phone</th>
+                            <th>Plan</th>
+                            <th className="hide-mobile">Branch</th>
+                            <th className="hide-mobile">Expiry Date</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {filteredMembers.length === 0 ? (
+                            <tr>
+                                <td colSpan="8">
+                                    <div className="empty-state">
+                                        <div className="empty-state-icon"></div>
+                                        <h3>No members found</h3>
+                                        <p>Try adjusting your search query or status filter.</p>
+                                    </div>
+                                </td>
+                            </tr>
+                        ) : filteredMembers.map((member, idx) => (
+                            <tr
+                                key={member._id}
+                                ref={member._id === highlightId ? highlightRef : null}
+                                style={member._id === highlightId ? {
+                                    background: 'var(--primary-light)',
+                                    outline: '2px solid var(--primary)',
+                                    transition: 'background 1s, outline 1s'
+                                } : {}}
+                            >
+                                <td>
+                                    <span style={{ fontFamily: 'monospace', fontWeight: '700', fontSize: '0.85rem', color: '#5F4A00', background: '#FBF2D8', padding: '0.2rem 0.5rem', borderRadius: '6px', border: '1px solid #F0E1A8' }}>
+                                        {member.displayId || member.empid || `MEM${1001 + idx}`}
+                                    </span>
+                                </td>
+                                <td>
+                                    <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem' }}>
+                                        {member.profileImageUrl ? (
+                                            <img src={member.profileImageUrl} alt="" style={{ width: 34, height: 34, borderRadius: '50%', objectFit: 'cover', flexShrink: 0 }} />
+                                        ) : (
+                                            <span style={{ width: 34, height: 34, borderRadius: '50%', display: 'grid', placeItems: 'center', flexShrink: 0, color: 'var(--primary)', background: 'var(--primary-light)', fontWeight: 800 }}>
+                                                {member.name?.charAt(0)?.toUpperCase() || 'M'}
+                                            </span>
+                                        )}
+                                        <div>
+                                            <div style={{ fontWeight: '600' }}>{member.name}</div>
+                                            <div style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{member.email}</div>
+                                        </div>
+                                    </div>
+                                </td>
+                                <td className="hide-mobile">{member.phone}</td>
+                                <td>{member.planId?.name || 'N/A'}</td>
+                                <td className="hide-mobile">
+                                    {member.branchId ? (
+                                        <span style={{ background: 'rgba(14,165,233,0.1)', color: '#0ea5e9', padding: '0.2rem 0.5rem', borderRadius: '6px', fontSize: '0.78rem', fontWeight: '600' }}>
+                                             {(() => {
+                                                 const memberBranchId = String(member.branchId?._id || member.branchId?.id || member.branchId || '');
+                                                 const branchFromDirectory = branches.find(b => String(b._id || b.id) === memberBranchId);
+                                                 const branchName = branchFromDirectory?.name || member.branchId?.name || member.branchName;
+                                                 return branchName && branchName.trim().toLowerCase() !== 'branch' ? branchName : 'Unknown branch';
+                                             })()}
+                                        </span>
+                                    ) : <span style={{ color: 'var(--text-secondary)', fontSize: '0.8rem' }}>—</span>}
+                                </td>
+                                <td className="hide-mobile">
+                                    {member.expiryDate && Number.isFinite(new Date(member.expiryDate).getTime())
+                                        ? new Date(member.expiryDate).toLocaleDateString()
+                                        : 'No expiry'}
+                                </td>
+                                <td><span className={`badge badge-${member.status.toLowerCase()}`}>{member.status}</span></td>
+                                <td>
+                                    <div style={{ display: 'flex', gap: '0.4rem' }}>
+                                        <button className="btn" style={{ padding: '0.4rem', border: '1px solid var(--border-color)', color: '#10b981', background: 'rgba(16,185,129,0.1)' }} title="Renew Plan" onClick={() => {
+                                            setRenewMemberData(member);
+                                            setRenewForm({ planId: member.planId?._id || member.planId || '', paidAmount: member.planId?.price || '', method: 'Cash', salesType: 'RENEWAL', salesStaffId: '', saleSource: '' });
+                                        }}>
+                                            <RefreshCw size={16} />
+                                        </button>
+                                        <button className="btn" style={{ padding: '0.4rem', border: '1px solid var(--border-color)', color: '#0ea5e9', background: 'rgba(14,165,233,0.1)' }} title="Transfer Branch" onClick={() => {
+                                            setTransferMemberData(member);
+                                            setTransferBranchId(member.branchId?._id || member.branchId || '');
+                                        }}>
+                                            <ArrowRightLeft size={16} />
+                                        </button>
+                                        {isConvertibleMember(member) && <button className="btn" style={{ padding: '0.4rem', border: '1px solid #b9a6f4', color: '#6b4cc2', background: 'rgba(139,92,246,0.1)' }} title={`Convert ${String(member.gymId?._id || member.gymId?.id || member.gymId || '') === 'SYSTEM' ? 'FitPass to H4' : 'H4 to FitPass'}`} aria-label={`Convert ${member.name} between FitPass and H4`} onClick={() => handleOpenDivisionConversion(member)}>
+                                            <ArrowRightLeft size={16} />
+                                        </button>}
+                                        {user?.role === 'superadmin' && (
+                                            <button className="btn" style={{ padding: '0.4rem', border: '1px solid #E7D9AD', color: '#5F4A00', background: '#FBF2D8' }} title="Audit Trail" aria-label={`View audit trail for ${member.name}`} onClick={() => handleOpenAudit(member)}>
+                                                <FileText size={16} />
+                                            </button>
+                                        )}
+                                        <button className="btn" style={{ padding: '0.4rem', border: '1px solid var(--border-color)', color: 'var(--text-secondary)' }} title="Show QR" onClick={() => { setViewingQRMember(member); setIsQRModalOpen(true); }}>
+                                            <Smartphone size={16} />
+                                        </button>
+                                        <button className="btn" style={{ padding: '0.4rem', border: '1px solid var(--border-color)', color: 'var(--text-secondary)' }} onClick={() => handleOpenModal(member)}>
+                                            <Pencil size={16} />
+                                        </button>
+                                        {['superadmin', 'admin', 'fitpass_admin', 'h4_admin'].includes(user?.role) && (
+                                            <button className="btn btn-danger" style={{ padding: '0.4rem' }} onClick={() => handleDelete(member._id)}>
+                                                <Trash2 size={16} />
+                                            </button>
+                                        )}
+                                    </div>
+                                </td>
+
+                            </tr>
+
+                        ))}
+                    </tbody>
+                </table>
+            </div>
+                 {/* Pagination Controls */}
+            {pages > 1 && (
+                <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', gap: '1rem', marginTop: '2rem' }}>
+                    <button
+                        className="btn"
+                        disabled={page === 1}
+                        onClick={() => setPage(page - 1)}
+                        style={{ opacity: page === 1 ? 0.5 : 1 }}
+                    >
+                         Previous
+                    </button>
+                    <span style={{ fontWeight: '600' }}>Page {page} of {pages}</span>
+                    <button
+                        className="btn"
+                        disabled={page === pages}
+                        onClick={() => setPage(page + 1)}
+                        style={{ opacity: page === pages ? 0.5 : 1 }}
+                    >
+                        Next
+                    </button>
+                </div>
+            )}
+
+            <Modal
+                isOpen={isModalOpen}
+                onClose={() => { setIsModalOpen(false); setConvertingLeadId(null); setWizardStep(1); }}
+                closeOnOverlayClick={false}
+                title={editingMember ? 'Edit Member Details' : ` Member Registration & Assessment (${wizardStep}/3)`}
+            >
+                <form
+                    onSubmit={(e) => {
+                        e.preventDefault();
+                    }}
+                    onKeyDown={(e) => {
+                        if (e.key === 'Enter' && e.target.tagName !== 'TEXTAREA') {
+                            e.preventDefault();
+                        }
+                    }}
+                >
+                    {convertingLeadId && (
+                        <div style={{ background: 'rgba(16,185,129,0.1)', color: '#10b981', padding: '0.6rem 0.85rem', borderRadius: '8px', marginBottom: '1rem', fontSize: '0.85rem', fontWeight: '600' }}>
+                             Converting lead to member — details pre-filled below.
+                        </div>
+                    )}
+
+                    {!editingMember && (
+                        <div style={{ display: 'flex', gap: '0.5rem', marginBottom: '1.5rem' }}>
+                            <div style={{ flex: 1, padding: '0.5rem', background: wizardStep >= 1 ? 'var(--primary, #f59e0b)' : 'rgba(255,255,255,0.05)', color: wizardStep >= 1 ? '#000' : 'var(--text-secondary)', borderRadius: '6px', textAlign: 'center', fontSize: '0.78rem', fontWeight: '700' }}>
+                                1. Personal & Plan
+                            </div>
+                            <div style={{ flex: 1, padding: '0.5rem', background: wizardStep >= 2 ? 'var(--primary, #f59e0b)' : 'rgba(255,255,255,0.05)', color: wizardStep >= 2 ? '#000' : 'var(--text-secondary)', borderRadius: '6px', textAlign: 'center', fontSize: '0.78rem', fontWeight: '700' }}>
+                                2. Goals (MCQ)
+                            </div>
+                            <div style={{ flex: 1, padding: '0.5rem', background: wizardStep >= 3 ? 'var(--primary, #f59e0b)' : 'rgba(255,255,255,0.05)', color: wizardStep >= 3 ? '#000' : 'var(--text-secondary)', borderRadius: '6px', textAlign: 'center', fontSize: '0.78rem', fontWeight: '700' }}>
+                                3. Health & Notes
+                            </div>
+                        </div>
+                    )}
+
+                    {/* ─── STEP 1: Personal & Plan Info ─── */}
+                    {(editingMember || wizardStep === 1) && (
+                        <div className="form-grid">
+                            <div className="input-group full-width">
+                                <label>Full Name *</label>
+                                <input className="input" type="text" value={formData.name} onChange={(e) => setFormData({ ...formData, name: e.target.value })} required />
+                            </div>
+                            <div className="input-group">
+                                <label>Phone Number *</label>
+                                <input className="input" type="text" value={formData.phone} onChange={(e) => setFormData({ ...formData, phone: e.target.value })} required />
+                            </div>
+                            <div className="input-group">
+                                <label>Email (Optional)</label>
+                                <input className="input" type="email" value={formData.email} onChange={(e) => setFormData({ ...formData, email: e.target.value })} />
+                            </div>
+                            <div className="input-group">
+                                <label>Subscription Plan {isH4Context ? '(Optional)' : '*'}</label>
+                                <select
+                                    className="input"
+                                    value={formData.planId}
+                                    onChange={(e) => {
+                                        const selected = plans.find(p => p._id === e.target.value);
+                                        const catPrice = selected ? Number(selected.price) : 0;
+                                        const disc = Math.max(0, Number(formData.discount) || 0);
+                                        const net = Math.max(0, catPrice - disc);
+                                        setFormData({
+                                            ...formData,
+                                            planId: e.target.value,
+                                            paidAmount: net
+                                        });
+                                    }}
+                                    required={!isH4Context}
+                                >
+                                    <option value="">Select a plan</option>
+                                    {plans.map(p => <option key={p._id} value={p._id}>{p.name} (₹{p.price})</option>)}
+                                </select>
+                            </div>
+
+                            {isH4Context && !editingMember && !formData.planId && (
+                                <div className="input-group">
+                                    <label>Membership Duration</label>
+                                    <select
+                                        className="input"
+                                        value={formData.durationPreset}
+                                        onChange={(e) => setFormData({
+                                            ...formData,
+                                            durationPreset: e.target.value,
+                                            durationDays: e.target.value === 'custom' ? '' : e.target.value
+                                        })}
+                                    >
+                                        <option value="30">30 days</option>
+                                        <option value="60">60 days</option>
+                                        <option value="custom">Custom</option>
+                                    </select>
+                                    {formData.durationPreset === 'custom' && (
+                                        <input
+                                            className="input"
+                                            style={{ marginTop: '0.5rem' }}
+                                            type="number"
+                                            min="1"
+                                            placeholder="Enter number of days"
+                                            value={formData.durationDays}
+                                            onChange={(e) => setFormData({ ...formData, durationDays: e.target.value })}
+                                            required
+                                        />
+                                    )}
+                                </div>
+                            )}
+
+                            {/* Plan Pricing & Discount Breakdown */}
+                            {formData.planId && (
+                                (() => {
+                                    const selected = plans.find(p => p._id === formData.planId);
+                                    const catPrice = selected ? Number(selected.price) : 0;
+                                    const disc = Math.max(0, Number(formData.discount) || 0);
+                                    const net = Math.max(0, catPrice - disc);
+                                    const paid = Math.max(0, Number(formData.paidAmount) || 0);
+                                    const pending = Math.max(0, net - paid);
+
+                                    return (
+                                        <div className="full-width" style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', borderRadius: '10px', padding: '1rem', marginTop: '0.25rem', marginBottom: '0.5rem' }}>
+                                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                                                <div>
+                                                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Catalogue Price</span>
+                                                    <strong style={{ fontSize: '1rem', color: '#fff' }}>₹{catPrice}</strong>
+                                                </div>
+                                                <div>
+                                                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Discount Given</span>
+                                                    <strong style={{ fontSize: '1rem', color: disc > 0 ? '#10b981' : '#fff' }}>-₹{disc}</strong>
+                                                </div>
+                                                <div>
+                                                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Net Agreed Fee</span>
+                                                    <strong style={{ fontSize: '1.1rem', color: 'var(--primary, #f59e0b)' }}>₹{net}</strong>
+                                                </div>
+                                                <div>
+                                                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Pending Balance</span>
+                                                    <strong style={{ fontSize: '1rem', color: pending > 0 ? '#ef4444' : '#10b981' }}>
+                                                        {pending > 0 ? `₹${pending} Due` : '₹0 Settled'}
+                                                    </strong>
+                                                </div>
+                                            </div>
+                                        </div>
+                                    );
+                                })()
+                            )}
+
+                            {!editingMember && formData.planId && (
+                                <>
+                                    <div className="input-group">
+                                        <label>Manual Discount (₹)</label>
+                                        <input
+                                            className="input"
+                                            type="number"
+                                            min="0"
+                                            value={formData.discount || ''}
+                                            onChange={(e) => {
+                                                const discVal = Math.max(0, Number(e.target.value) || 0);
+                                                const selected = plans.find(p => p._id === formData.planId);
+                                                const catPrice = selected ? Number(selected.price) : 0;
+                                                const net = Math.max(0, catPrice - discVal);
+                                                setFormData({
+                                                    ...formData,
+                                                    discount: e.target.value,
+                                                    paidAmount: net
+                                                });
+                                            }}
+                                            placeholder="0 (No discount)"
+                                        />
+                                    </div>
+                                    <div className="input-group">
+                                        <label>Amount Paid Upfront (₹) *</label>
+                                        <input
+                                            className="input"
+                                            type="number"
+                                            min="0"
+                                            value={formData.paidAmount}
+                                            onChange={(e) => setFormData({ ...formData, paidAmount: e.target.value })}
+                                            placeholder="Amount collected now"
+                                            required
+                                        />
+                                    </div>
+                                    <div className="input-group">
+                                        <label>Payment Method</label>
+                                        <select
+                                            className="input"
+                                            value={formData.paymentMethod || 'Cash'}
+                                            onChange={(e) => setFormData({ ...formData, paymentMethod: e.target.value })}
+                                        >
+                                            <option value="Cash">Cash</option>
+                                            <option value="UPI">UPI</option>
+                                            <option value="Card">Card</option>
+                                            <option value="Bank Transfer">Bank Transfer</option>
+                                        </select>
+                                    </div>
+                                    <div className="input-group">
+                                        <label>Lead source</label>
+                                        <select className="input" value={formData.saleSource || ''} onChange={(e) => setFormData({ ...formData, saleSource: e.target.value })}>
+                                            <option value="">Direct / not from a lead</option>
+                                            {['Offline', 'Online', 'Referral', 'Walk-in', 'Instagram', 'Facebook', 'Google', 'WhatsApp', 'Other'].map(source => <option key={source} value={source}>{source}</option>)}
+                                        </select>
+                                    </div>
+                                    <div className="input-group">
+                                        <label>Sale handled by</label>
+                                        <select className="input" value={formData.salesStaffId || ''} onChange={(e) => setFormData({ ...formData, salesStaffId: e.target.value })}>
+                                            <option value="">Current user ({user?.name || 'me'})</option>
+                                            {salesStaff.map(staff => <option key={staff._id || staff.id} value={staff._id || staff.id}>{staff.name}</option>)}
+                                        </select>
+                                    </div>
+                                </>
+                            )}
+
+                            {(!user?.branchId || isH4Context) && (
+                                <div className="input-group">
+                                    <label>Branch (optional)</label>
+                                    <select className="input" value={formData.branchId} onChange={(e) => setFormData({ ...formData, branchId: e.target.value })}>
+                                        <option value="">No Branch / All Locations</option>
+                                        {branches.map(b => {
+                                            const branchId = b._id || b.id;
+                                            return <option key={branchId} value={branchId}>{b.name}</option>;
+                                        })}
+                                    </select>
+                                </div>
+                            )}
+                            {['superadmin', 'fitpass_admin'].includes(user?.role) && !isH4Context && (
+                                <div className="input-group">
+                                    <label>Gym Division / Partner Gym</label>
+                                    <select className="input" value={formData.gymId} onChange={(e) => setFormData({ ...formData, gymId: e.target.value })} required>
+                                        <option value="">Select Gym</option>
+                                        {gyms.map(g => <option key={g._id || g.id} value={g._id || g.id}>{g.name}</option>)}
+                                    </select>
+                                </div>
+                            )}
+                            <div className="input-group">
+                                <label>{editingMember ? 'Reset Password (optional)' : 'Password (optional, default: Phone)'}</label>
+                                <input className="input" type="password" placeholder="Set member password" value={formData.password || ''} onChange={(e) => setFormData({ ...formData, password: e.target.value })} />
+                            </div>
+                            {!editingMember && (
+                                <div className="input-group">
+                                    <label>Join Date *</label>
+                                    <input className="input" type="date" value={formData.joinDate} onChange={(e) => setFormData({ ...formData, joinDate: e.target.value })} required />
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {/* ─── STEP 2: MCQ Fitness & Lifestyle Questionnaire ─── */}
+                    {!editingMember && wizardStep === 2 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+                            <div className="input-group">
+                                <label style={{ fontWeight: '700', marginBottom: '0.5rem', display: 'block', color: 'var(--text-color, #1f2937)' }}>Q1. What is the member's Primary Fitness Goal? (Multiple Choice)</label>
+                                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                                    {[
+                                        { val: 'Fat Loss', label: ' Fat Loss & Toning' },
+                                        { val: 'Muscle Hypertrophy', label: ' Muscle Mass & Bodybuilding' },
+                                        { val: 'Athletic Endurance', label: ' Athletic Endurance & Cardio' },
+                                        { val: 'General Wellness', label: ' Mobility & General Health' }
+                                    ].map(opt => (
+                                        <div
+                                            key={opt.val}
+                                            onClick={() => setQuestionnaire({ ...questionnaire, fitnessGoal: opt.val })}
+                                            style={{
+                                                padding: '0.85rem',
+                                                borderRadius: '8px',
+                                                border: `2px solid ${questionnaire.fitnessGoal === opt.val ? 'var(--primary, #f59e0b)' : 'var(--border-color, #d1d5db)'}`,
+                                                background: questionnaire.fitnessGoal === opt.val ? 'rgba(245, 158, 11, 0.12)' : 'var(--bg-card, rgba(0,0,0,0.02))',
+                                                cursor: 'pointer',
+                                                fontSize: '0.88rem',
+                                                fontWeight: questionnaire.fitnessGoal === opt.val ? '700' : '600',
+                                                color: questionnaire.fitnessGoal === opt.val ? 'var(--primary, #d97706)' : 'var(--text-color, #1f2937)'
+                                            }}
+                                        >
+                                            {opt.label}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="input-group">
+                                <label style={{ fontWeight: '700', marginBottom: '0.5rem', display: 'block', color: 'var(--text-color, #1f2937)' }}>Q2. Gym Training Experience Level? (Multiple Choice)</label>
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem' }}>
+                                    {[
+                                        { val: 'Beginner', label: ' Beginner (< 6 mos)' },
+                                        { val: 'Intermediate', label: ' Intermediate (1-2 yrs)' },
+                                        { val: 'Advanced', label: ' Advanced (3+ yrs)' }
+                                    ].map(opt => (
+                                        <div
+                                            key={opt.val}
+                                            onClick={() => setQuestionnaire({ ...questionnaire, experienceLevel: opt.val })}
+                                            style={{
+                                                padding: '0.75rem 0.5rem',
+                                                borderRadius: '8px',
+                                                border: `2px solid ${questionnaire.experienceLevel === opt.val ? 'var(--primary, #f59e0b)' : 'var(--border-color, #d1d5db)'}`,
+                                                background: questionnaire.experienceLevel === opt.val ? 'rgba(245, 158, 11, 0.12)' : 'var(--bg-card, rgba(0,0,0,0.02))',
+                                                cursor: 'pointer',
+                                                textAlign: 'center',
+                                                fontSize: '0.82rem',
+                                                fontWeight: questionnaire.experienceLevel === opt.val ? '700' : '600',
+                                                color: questionnaire.experienceLevel === opt.val ? 'var(--primary, #d97706)' : 'var(--text-color, #1f2937)'
+                                            }}
+                                        >
+                                            {opt.label}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="input-group">
+                                <label style={{ fontWeight: '700', marginBottom: '0.5rem', display: 'block', color: 'var(--text-color, #1f2937)' }}>Q3. Planned Workout Frequency? (Multiple Choice)</label>
+                                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '0.5rem' }}>
+                                    {['1-2 Days / Week', '3-4 Days / Week', '5-6 Days / Week'].map(freq => (
+                                        <div
+                                            key={freq}
+                                            onClick={() => setQuestionnaire({ ...questionnaire, workoutFrequency: freq })}
+                                            style={{
+                                                padding: '0.75rem 0.5rem',
+                                                borderRadius: '8px',
+                                                border: `2px solid ${questionnaire.workoutFrequency === freq ? 'var(--primary, #f59e0b)' : 'var(--border-color, #d1d5db)'}`,
+                                                background: questionnaire.workoutFrequency === freq ? 'rgba(245, 158, 11, 0.12)' : 'var(--bg-card, rgba(0,0,0,0.02))',
+                                                cursor: 'pointer',
+                                                textAlign: 'center',
+                                                fontSize: '0.82rem',
+                                                fontWeight: questionnaire.workoutFrequency === freq ? '700' : '600',
+                                                color: questionnaire.workoutFrequency === freq ? 'var(--primary, #d97706)' : 'var(--text-color, #1f2937)'
+                                            }}
+                                        >
+                                            {freq}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+
+                            <div className="input-group">
+                                <label style={{ fontWeight: '700', marginBottom: '0.5rem', display: 'block', color: 'var(--text-color, #1f2937)' }}>Q4. Dietary / Nutrition Preference? (Multiple Choice)</label>
+                                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '0.75rem' }}>
+                                    {[
+                                        { val: 'Vegetarian', label: ' Vegetarian' },
+                                        { val: 'Non-Vegetarian', label: ' Non-Vegetarian' },
+                                        { val: 'Vegan', label: ' Vegan / Plant-Based' },
+                                        { val: 'Keto', label: ' High Protein / Keto' }
+                                    ].map(diet => (
+                                        <div
+                                            key={diet.val}
+                                            onClick={() => setQuestionnaire({ ...questionnaire, dietPreference: diet.val })}
+                                            style={{
+                                                padding: '0.75rem',
+                                                borderRadius: '8px',
+                                                border: `2px solid ${questionnaire.dietPreference === diet.val ? 'var(--primary, #f59e0b)' : 'var(--border-color, #d1d5db)'}`,
+                                                background: questionnaire.dietPreference === diet.val ? 'rgba(245, 158, 11, 0.12)' : 'var(--bg-card, rgba(0,0,0,0.02))',
+                                                cursor: 'pointer',
+                                                fontSize: '0.85rem',
+                                                fontWeight: questionnaire.dietPreference === diet.val ? '700' : '600',
+                                                color: questionnaire.dietPreference === diet.val ? 'var(--primary, #d97706)' : 'var(--text-color, #1f2937)'
+                                            }}
+                                        >
+                                            {diet.label}
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* ─── STEP 3: Specific Health & Emergency Textbox Questions ─── */}
+                    {!editingMember && wizardStep === 3 && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '1.25rem' }}>
+                            <div className="input-group">
+                                <label style={{ fontWeight: '700', marginBottom: '0.4rem', display: 'block', color: 'var(--text-color, #1f2937)' }}>Q5. Medical History, Past Injuries or Pre-existing Conditions (Text Box)</label>
+                                <textarea
+                                    className="input"
+                                    rows="3"
+                                    placeholder="Enter details (e.g. Lower back pain, asthma, past surgery, hypertension, or 'None')"
+                                    value={questionnaire.medicalHistory}
+                                    onChange={(e) => setQuestionnaire({ ...questionnaire, medicalHistory: e.target.value })}
+                                />
+                            </div>
+
+                            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                                <div className="input-group">
+                                    <label style={{ fontWeight: '700', marginBottom: '0.4rem', display: 'block', color: 'var(--text-color, #1f2937)' }}>Emergency Contact Name</label>
+                                    <input
+                                        className="input"
+                                        type="text"
+                                        placeholder="e.g. John Doe (Spouse / Parent)"
+                                        value={questionnaire.emergencyContactName}
+                                        onChange={(e) => setQuestionnaire({ ...questionnaire, emergencyContactName: e.target.value })}
+                                    />
+                                </div>
+                                <div className="input-group">
+                                    <label style={{ fontWeight: '700', marginBottom: '0.4rem', display: 'block', color: 'var(--text-color, #1f2937)' }}>Emergency Phone</label>
+                                    <input
+                                        className="input"
+                                        type="text"
+                                        placeholder="e.g. 9876543210"
+                                        value={questionnaire.emergencyContactPhone}
+                                        onChange={(e) => setQuestionnaire({ ...questionnaire, emergencyContactPhone: e.target.value })}
+                                    />
+                                </div>
+                            </div>
+
+                            <div className="input-group">
+                                <label style={{ fontWeight: '700', marginBottom: '0.4rem', display: 'block', color: 'var(--text-color, #1f2937)' }}>Q6. Specific Fitness Remarks & Coach Instructions (Text Box)</label>
+                                <textarea
+                                    className="input"
+                                    rows="2"
+                                    placeholder="Any specific instructions, target weight, or special trainer notes..."
+                                    value={questionnaire.specialNotes}
+                                    onChange={(e) => setQuestionnaire({ ...questionnaire, specialNotes: e.target.value })}
+                                />
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Wizard Navigation & Action Buttons */}
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: '1rem', marginTop: '1.75rem' }}>
+                        {editingMember ? (
+                            <button
+                                type="button"
+                                className="btn btn-primary"
+                                style={{ width: '100%' }}
+                                onClick={(e) => handleSubmit(e)}
+                            >
+                                Update Member Details
+                            </button>
+                        ) : (
+                            <>
+                                {wizardStep > 1 && (
+                                    <button
+                                        type="button"
+                                        className="btn btn-secondary"
+                                        onClick={(e) => {
+                                            e.preventDefault();
+                                            e.stopPropagation();
+                                            setWizardStep(prev => prev - 1);
+                                        }}
+                                    >
+                                         Back
+                                    </button>
+                                )}
+
+                                {wizardStep < 3 ? (
+                                    <button
+                                        type="button"
+                                        className="btn btn-primary"
+                                        style={{ marginLeft: 'auto' }}
+                                        onClick={(e) => {
+                                            e.preventDefault();
+                                            e.stopPropagation();
+                                            if (!formData.name || !formData.phone || (!isH4Context && !formData.planId)) {
+                                                alert(isH4Context ? 'Please fill in Member Name and Phone Number first.' : 'Please fill in Member Name, Phone Number, and select a Subscription Plan first.');
+                                                return;
+                                            }
+                                            setWizardStep(prev => prev + 1);
+                                        }}
+                                    >
+                                        Next: {wizardStep === 1 ? 'Fitness Questionnaire ' : 'Medical Details '}
+                                    </button>
+                                ) : (
+                                    <button
+                                        type="button"
+                                        className="btn btn-primary"
+                                        style={{ marginLeft: 'auto' }}
+                                        onClick={(e) => {
+                                            e.preventDefault();
+                                            e.stopPropagation();
+                                            handleSubmit(e);
+                                        }}
+                                    >
+                                        Submit Registration
+                                    </button>
+                                )}
+                            </>
+                        )}
+                    </div>
+                </form>
+            </Modal>
+
+            {/* QR Code Modal */}
+            <Modal isOpen={isQRModalOpen} onClose={() => setIsQRModalOpen(false)} title="Member QR Attendance Code">
+                {viewingQRMember && (
+                    <div style={{ textAlign: 'center', padding: '1rem' }}>
+                        <div style={{ padding: '1.5rem', background: 'white', borderRadius: '12px', display: 'inline-block', boxShadow: '0 4px 6px -1px rgba(0,0,0,0.1)' }}>
+                            <QRCodeCanvas
+                                id="member-qr"
+                                value={viewingQRMember._id}
+                                size={200}
+                                level="H"
+                                includeMargin={true}
+                            />
+                        </div>
+                        <h3 style={{ marginTop: '1.5rem', marginBottom: '0.5rem' }}>{viewingQRMember.name}</h3>
+                        <p style={{ color: 'var(--text-secondary)', marginBottom: '1.5rem' }}>Member ID: {viewingQRMember._id}</p>
+                        <button className="btn btn-primary" style={{ width: '100%' }} onClick={handleDownloadQR}>Download QR Code</button>
+                    </div>
+                )}
+            </Modal>
+
+            {/* Audit Trail Modal */}
+            <Modal isOpen={isAuditModalOpen} onClose={() => setIsAuditModalOpen(false)} title="Member Profile & Audit Trail">
+                {loadingAudit ? (
+                    <div style={{ textAlign: 'center', padding: '3rem' }}>
+                        <div className="spinner" style={{ margin: '0 auto 1rem auto' }}></div>
+                        <p style={{ color: 'var(--text-secondary)' }}>Loading audit trail...</p>
+                    </div>
+                ) : auditData ? (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem', maxHeight: '75vh', overflowY: 'auto', paddingRight: '0.5rem' }}>
+                        
+                        {/* Member Card */}
+                        <div style={{ background: 'var(--card-bg, #2D251C)', border: '1px solid var(--border-color, #3A3025)', borderRadius: '12px', padding: '1.5rem' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '1rem' }}>
+                                <div>
+                                    <h3 style={{ fontSize: '1.25rem', color: '#fff', marginBottom: '0.25rem' }}>{auditData.member.name}</h3>
+                                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', margin: 0 }}> {auditData.member.phone} |  {auditData.member.email || 'No email'}</p>
+                                </div>
+                                <span className={`badge badge-${auditData.member.status.toLowerCase()}`}>{auditData.member.status}</span>
+                            </div>
+                            
+                            <hr style={{ borderColor: 'var(--border-color, #3A3025)', margin: '1rem 0' }} />
+                            
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '1rem' }}>
+                                <div>
+                                    <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', display: 'block', marginBottom: '0.25rem' }}>Current Division/Gym</span>
+                                    <strong style={{ color: '#fff' }}> {auditData.member.gymName}</strong>
+                                </div>
+                                <div>
+                                    <span style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', display: 'block', marginBottom: '0.25rem' }}>Joined Date</span>
+                                    <strong style={{ color: '#fff' }}> {new Date(auditData.member.joinDate).toLocaleDateString()} ({auditData.member.joinMonth})</strong>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Financials & Subscription Plan */}
+                        <div style={{ background: 'var(--card-bg, #2D251C)', border: '1px solid var(--border-color, #3A3025)', borderRadius: '12px', padding: '1.5rem' }}>
+                            <h4 style={{ fontSize: '1rem', color: 'var(--primary)', marginBottom: '1rem', marginTop: 0 }}>Subscription & Financial Summary</h4>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '0.75rem', marginBottom: '1rem' }}>
+                                <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Current Plan</span>
+                                    <strong style={{ fontSize: '0.95rem', color: '#fff' }}>{auditData.member.currentPlan ? auditData.member.currentPlan.name : 'No active plan'}</strong>
+                                </div>
+                                <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Catalogue Price</span>
+                                    <strong style={{ fontSize: '1.05rem', color: '#fff' }}>₹{auditData.member.financials.catalogPrice || auditData.member.financials.planPrice}</strong>
+                                </div>
+                                {auditData.member.financials.discountAmount > 0 && (
+                                    <div style={{ background: 'rgba(16,185,129,0.05)', padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(16,185,129,0.2)' }}>
+                                        <span style={{ fontSize: '0.75rem', color: '#10b981', display: 'block' }}>Discount Given</span>
+                                        <strong style={{ fontSize: '1.05rem', color: '#10b981' }}>-₹{auditData.member.financials.discountAmount}</strong>
+                                    </div>
+                                )}
+                                <div style={{ background: 'rgba(245,158,11,0.05)', padding: '0.75rem', borderRadius: '8px', border: '1px solid rgba(245,158,11,0.2)' }}>
+                                    <span style={{ fontSize: '0.75rem', color: 'var(--primary, #f59e0b)', display: 'block' }}>Net Agreed Fee</span>
+                                    <strong style={{ fontSize: '1.1rem', color: 'var(--primary, #f59e0b)' }}>₹{auditData.member.financials.planPrice}</strong>
+                                </div>
+                                <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                    <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Total Paid</span>
+                                    <strong style={{ fontSize: '1.1rem', color: '#10b981' }}>₹{auditData.member.financials.paidAmount}</strong>
+                                </div>
+                                <div style={{ background: auditData.member.financials.pendingAmount > 0 ? 'rgba(198,40,40,0.1)' : 'rgba(16,185,129,0.05)', padding: '0.75rem', borderRadius: '8px', border: auditData.member.financials.pendingAmount > 0 ? '1px solid #C62828' : '1px solid rgba(16,185,129,0.2)' }}>
+                                    <span style={{ fontSize: '0.75rem', color: auditData.member.financials.pendingAmount > 0 ? '#ff8a80' : '#10b981', display: 'block' }}>Pending Balance</span>
+                                    <strong style={{ fontSize: '1.1rem', color: auditData.member.financials.pendingAmount > 0 ? '#C62828' : '#10b981' }}>
+                                        {auditData.member.financials.pendingAmount > 0 ? `₹${auditData.member.financials.pendingAmount} Due` : '₹0 Settled'}
+                                    </strong>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* Division Switch History */}
+                        <div style={{ background: 'var(--card-bg, #2D251C)', border: '1px solid var(--border-color, #3A3025)', borderRadius: '12px', padding: '1.5rem' }}>
+                            <h4 style={{ fontSize: '1rem', color: 'var(--primary)', marginBottom: '1rem', marginTop: 0 }}>Division Transition History</h4>
+                            {auditData.divisionSwitches.length === 0 ? (
+                                <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', margin: 0 }}>No transition events recorded. Member has remained in their initial division since registration.</p>
+                            ) : (
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                                    {auditData.divisionSwitches.map((sw, idx) => (
+                                        <div key={idx} style={{ padding: '0.75rem', background: 'rgba(240,160,32,0.04)', borderLeft: '3px solid var(--primary)', borderRadius: '0 8px 8px 0' }}>
+                                            <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '0.5rem', marginBottom: '0.25rem' }}>
+                                                <strong style={{ fontSize: '0.88rem', color: '#fff' }}>{sw.details}</strong>
+                                                <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)' }}>{new Date(sw.timestamp).toLocaleString()}</span>
+                                            </div>
+                                            <p style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', margin: 0 }}>Authorized by: {sw.performedBy}</p>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* SuperAdmin Conversion controls */}
+                        {['superadmin', 'fitpass_admin'].includes(user?.role) && (
+                            <div style={{ background: 'var(--card-bg, #2D251C)', border: '1px solid var(--border-color, #3A3025)', borderRadius: '12px', padding: '1.5rem' }}>
+                                <h4 style={{ fontSize: '1rem', color: 'var(--primary)', marginBottom: '1.0rem', marginTop: 0 }}> Convert Member Type / Division</h4>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
+                                    <p style={{ fontSize: '0.85rem', color: 'var(--text-secondary)', margin: 0 }}>
+                                        Instantly transition this member's type by migrating them to a different division/gym. This will trigger audit logging.
+                                    </p>
+                                    <div style={{ display: 'flex', gap: '0.75rem', alignItems: 'center', flexWrap: 'wrap' }}>
+                                        <select
+                                            style={{
+                                                padding: '0.5rem 1rem',
+                                                borderRadius: '8px',
+                                                border: '1px solid var(--border-color, #3A3025)',
+                                                background: 'var(--bg-secondary, #231D14)',
+                                                color: '#fff',
+                                                fontSize: '0.88rem',
+                                                flex: 1,
+                                                minWidth: '200px'
+                                            }}
+                                            value={auditData.member.gymId || ''}
+                                            onChange={async (e) => {
+                                                const newGymId = e.target.value;
+                                                if (newGymId === auditData.member.gymId) return;
+                                                if (window.confirm(`Are you sure you want to transition this member to the selected gym/division?`)) {
+                                                    try {
+                                                        setLoadingAudit(true);
+                                                        await updateMember(auditData.member.id, { gymId: newGymId });
+                                                        // Refetch audit trail data
+                                                        const freshAudit = await getMemberAuditTrail(auditData.member.id);
+                                                        setAuditData(freshAudit);
+                                                        fetchData(); // update background members table
+                                                    } catch (err) {
+                                                        alert(err.response?.data?.message || 'Failed to transition member');
+                                                    } finally {
+                                                        setLoadingAudit(false);
+                                                    }
+                                                }
+                                            }}
+                                        >
+                                            <option value="" disabled>Select Division / Gym</option>
+                                            {gyms.map(g => (
+                                                <option key={g._id || g.id} value={g._id || g.id}>
+                                                    {g.name === 'H4' ? ' H4 (Gym Membership)' : ` ${g.name} (FitPass Partner)`}
+                                                </option>
+                                            ))}
+                                        </select>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* Member Fitness, Diet & Health Profile */}
+                        {(() => {
+                            const assessmentLog = auditData.auditLogs?.find(l => l.action === 'MEMBER_ASSESSMENT');
+                            let parsed = {
+                                fitnessGoal: 'Fat Loss & Toning',
+                                experienceLevel: 'Beginner (< 6 mos)',
+                                workoutFrequency: '3-4 Days / Week',
+                                dietPreference: 'Vegetarian',
+                                medicalHistory: 'None declared',
+                                emergencyContact: 'None provided',
+                                specialNotes: 'Standard fitness orientation & onboarding routine'
+                            };
+
+                            if (assessmentLog?.details) {
+                                const d = assessmentLog.details;
+                                const goalMatch = d.match(/Goal:\s*([^|]+)/i);
+                                const expMatch = d.match(/Experience:\s*([^|]+)/i);
+                                const freqMatch = d.match(/Frequency:\s*([^|]+)/i);
+                                const dietMatch = d.match(/Diet:\s*([^|]+)/i);
+                                const medMatch = d.match(/Medical:\s*([^|]+)/i);
+                                const emergMatch = d.match(/Emergency:\s*([^|]+)/i);
+                                const notesMatch = d.match(/Notes:\s*(.+)$/i);
+
+                                if (goalMatch) parsed.fitnessGoal = goalMatch[1].trim();
+                                if (expMatch) parsed.experienceLevel = expMatch[1].trim();
+                                if (freqMatch) parsed.workoutFrequency = freqMatch[1].trim();
+                                if (dietMatch) parsed.dietPreference = dietMatch[1].trim();
+                                if (medMatch) parsed.medicalHistory = medMatch[1].trim();
+                                if (emergMatch) parsed.emergencyContact = emergMatch[1].trim();
+                                if (notesMatch) parsed.specialNotes = notesMatch[1].trim();
+                            }
+
+                            return (
+                                <div style={{ background: 'var(--card-bg, #2D251C)', border: '1px solid var(--border-color, #3A3025)', borderRadius: '12px', padding: '1.5rem' }}>
+                                    <h4 style={{ fontSize: '1rem', color: 'var(--primary)', marginBottom: '1rem', marginTop: 0 }}>
+                                         Member Lifestyle, Diet & Health Profile
+                                    </h4>
+                                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: '0.85rem' }}>
+                                        <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}> Diet & Nutrition</span>
+                                            <strong style={{ fontSize: '0.95rem', color: '#10b981' }}>{parsed.dietPreference}</strong>
+                                        </div>
+                                        <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}> Primary Fitness Goal</span>
+                                            <strong style={{ fontSize: '0.95rem', color: '#fff' }}>{parsed.fitnessGoal}</strong>
+                                        </div>
+                                        <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}> Training Experience</span>
+                                            <strong style={{ fontSize: '0.95rem', color: '#fff' }}>{parsed.experienceLevel}</strong>
+                                        </div>
+                                        <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}> Workout Frequency</span>
+                                            <strong style={{ fontSize: '0.95rem', color: '#fff' }}>{parsed.workoutFrequency}</strong>
+                                        </div>
+                                        <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}> Medical / Injuries</span>
+                                            <strong style={{ fontSize: '0.92rem', color: '#fff' }}>{parsed.medicalHistory}</strong>
+                                        </div>
+                                        <div style={{ background: 'rgba(255,255,255,0.02)', padding: '0.75rem', borderRadius: '8px' }}>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}> Emergency Contact</span>
+                                            <strong style={{ fontSize: '0.92rem', color: '#fff' }}>{parsed.emergencyContact}</strong>
+                                        </div>
+                                    </div>
+                                    {parsed.specialNotes && (
+                                        <div style={{ marginTop: '0.85rem', padding: '0.65rem 0.85rem', background: 'rgba(240,160,32,0.04)', borderRadius: '8px', borderLeft: '3px solid var(--primary)' }}>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}> Coach Remarks & Instructions:</span>
+                                            <p style={{ fontSize: '0.85rem', color: '#fff', margin: '0.2rem 0 0 0' }}>{parsed.specialNotes}</p>
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })()}
+
+                        {/* Comprehensive Audit Logs */}
+                        <div style={{ background: 'var(--card-bg, #2D251C)', border: '1px solid var(--border-color, #3A3025)', borderRadius: '12px', padding: '1.5rem' }}>
+                            <h4 style={{ fontSize: '1rem', color: 'var(--primary)', marginBottom: '1rem', marginTop: 0 }}>Comprehensive Action Audit Logs</h4>
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem', maxHeight: '200px', overflowY: 'auto', paddingRight: '0.25rem' }}>
+                                {auditData.auditLogs.map((log) => (
+                                    <div key={log._id} style={{ padding: '0.6rem', borderBottom: '1px solid var(--border-color, #3A3025)', display: 'flex', justifyContent: 'space-between', gap: '1rem', alignItems: 'center' }}>
+                                        <div>
+                                            <span style={{ fontSize: '0.7rem', color: 'var(--primary)', textTransform: 'uppercase', fontWeight: 'bold', display: 'block' }}>{log.action}</span>
+                                            <p style={{ fontSize: '0.82rem', color: '#fff', margin: '0.15rem 0' }}>{log.details}</p>
+                                            <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)' }}>Actor: {log.userName} ({log.userRole})</span>
+                                        </div>
+                                        <span style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>{new Date(log.createdAt).toLocaleDateString()}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                    </div>
+                ) : (
+                    <p style={{ textAlign: 'center', color: 'var(--text-secondary)' }}>No audit data available</p>
+                )}
+
+            </Modal>
+
+            {/* Renew Plan Modal */}
+            <Modal isOpen={!!renewMemberData} onClose={() => setRenewMemberData(null)} title={` Upgrade / Renew Plan: ${renewMemberData?.name}`}>
+                <form onSubmit={async (e) => {
+                    e.preventDefault();
+                    setSubmittingAction(true);
+                    try {
+                        const selected = plans.find(p => p._id === renewForm.planId);
+                        const catalogPrice = selected ? selected.price : 0;
+                        const disc = Math.max(0, Number(renewForm.discount) || 0);
+                        const finalPrice = Math.max(0, catalogPrice - disc);
+
+                        await API.post(`/members/${renewMemberData._id}/renew`, {
+                            ...renewForm,
+                            discount: disc,
+                            finalPrice,
+                            paidAmount: Number(renewForm.paidAmount) || 0
+                        });
+                        setRenewMemberData(null);
+                        fetchData();
+                    } catch (err) {
+                        alert(err.response?.data?.message || 'Failed to renew membership');
+                    } finally {
+                        setSubmittingAction(false);
+                    }
+                }}>
+                    <div className="input-group">
+                        <label>Select Plan *</label>
+                        <select
+                            className="input"
+                            value={renewForm.planId}
+                            onChange={(e) => {
+                                const selected = plans.find(p => p._id === e.target.value);
+                                const catPrice = selected ? selected.price : 0;
+                                const disc = Number(renewForm.discount) || 0;
+                                const net = Math.max(0, catPrice - disc);
+                                setRenewForm({
+                                    ...renewForm,
+                                    planId: e.target.value,
+                                    paidAmount: net
+                                });
+                            }}
+                            required
+                        >
+                            <option value="">Select Plan</option>
+                            {plans.map(p => (
+                                <option key={p._id} value={p._id}>{p.name} — ₹{p.price} ({p.duration ? `${p.duration} days` : `${p.sessions} sessions`})</option>
+                            ))}
+                        </select>
+                    </div>
+
+                    {renewForm.planId && (
+                        (() => {
+                            const selected = plans.find(p => p._id === renewForm.planId);
+                            const catPrice = selected ? Number(selected.price) : 0;
+                            const disc = Math.max(0, Number(renewForm.discount) || 0);
+                            const net = Math.max(0, catPrice - disc);
+                            const paid = Math.max(0, Number(renewForm.paidAmount) || 0);
+                            const pending = Math.max(0, net - paid);
+
+                            return (
+                                <div style={{ background: 'rgba(255,255,255,0.03)', border: '1px solid var(--border-color)', borderRadius: '10px', padding: '1rem', marginBottom: '1.25rem' }}>
+                                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '0.75rem', marginBottom: '0.75rem' }}>
+                                        <div>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Catalogue Price</span>
+                                            <strong style={{ fontSize: '1rem', color: '#fff' }}>₹{catPrice}</strong>
+                                        </div>
+                                        <div>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Discount Applied</span>
+                                            <strong style={{ fontSize: '1rem', color: disc > 0 ? '#10b981' : '#fff' }}>-₹{disc}</strong>
+                                        </div>
+                                        <div>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Net Agreed Fee</span>
+                                            <strong style={{ fontSize: '1.1rem', color: 'var(--primary, #f59e0b)' }}>₹{net}</strong>
+                                        </div>
+                                        <div>
+                                            <span style={{ fontSize: '0.75rem', color: 'var(--text-secondary)', display: 'block' }}>Pending Balance</span>
+                                            <strong style={{ fontSize: '1rem', color: pending > 0 ? '#ef4444' : '#10b981' }}>
+                                                {pending > 0 ? `₹${pending} Due` : '₹0 Settled'}
+                                            </strong>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })()
+                    )}
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                        <div className="input-group">
+                            <label>Manual Discount (₹)</label>
+                            <input
+                                className="input"
+                                type="number"
+                                min="0"
+                                value={renewForm.discount || ''}
+                                onChange={(e) => {
+                                    const discVal = Math.max(0, Number(e.target.value) || 0);
+                                    const selected = plans.find(p => p._id === renewForm.planId);
+                                    const catPrice = selected ? Number(selected.price) : 0;
+                                    const net = Math.max(0, catPrice - discVal);
+                                    setRenewForm({
+                                        ...renewForm,
+                                        discount: e.target.value,
+                                        paidAmount: net
+                                    });
+                                }}
+                                placeholder="0 (No discount)"
+                            />
+                        </div>
+
+                        <div className="input-group">
+                            <label>Amount Paid Now (₹) *</label>
+                            <input
+                                className="input"
+                                type="number"
+                                min="0"
+                                value={renewForm.paidAmount}
+                                onChange={(e) => setRenewForm({ ...renewForm, paidAmount: e.target.value })}
+                                placeholder="Amount collected"
+                                required
+                            />
+                        </div>
+                    </div>
+
+                    <div className="input-group">
+                        <label>Transaction type</label>
+                        <select className="input" value={renewForm.salesType || 'RENEWAL'} onChange={(e) => setRenewForm({ ...renewForm, salesType: e.target.value })}>
+                            <option value="RENEWAL">Renewal</option>
+                            <option value="UPGRADE">Package upgrade</option>
+                        </select>
+                    </div>
+                    <div className="input-group">
+                        <label>Lead source (if applicable)</label>
+                        <select className="input" value={renewForm.saleSource || ''} onChange={(e) => setRenewForm({ ...renewForm, saleSource: e.target.value })}>
+                            <option value="">Existing member / direct</option>
+                            {['Offline', 'Online', 'Referral', 'Walk-in', 'Instagram', 'Facebook', 'Google', 'WhatsApp', 'Other'].map(source => <option key={source} value={source}>{source}</option>)}
+                        </select>
+                    </div>
+                    <div className="input-group">
+                        <label>Sale handled by</label>
+                        <select className="input" value={renewForm.salesStaffId || ''} onChange={(e) => setRenewForm({ ...renewForm, salesStaffId: e.target.value })}>
+                            <option value="">Current user ({user?.name || 'me'})</option>
+                            {salesStaff.map(staff => <option key={staff._id || staff.id} value={staff._id || staff.id}>{staff.name}</option>)}
+                        </select>
+                    </div>
+                    <div className="input-group">
+                        <label>Payment Method</label>
+                        <select
+                            className="input"
+                            value={renewForm.method}
+                            onChange={(e) => setRenewForm({ ...renewForm, method: e.target.value })}
+                        >
+                            <option value="Cash">Cash</option>
+                            <option value="UPI">UPI</option>
+                            <option value="Card">Card</option>
+                            <option value="Bank Transfer">Bank Transfer</option>
+                        </select>
+                    </div>
+
+                    <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: '1.5rem' }} disabled={submittingAction}>
+                        {submittingAction ? 'Processing Plan Upgrade...' : 'Confirm Plan Upgrade / Renewal'}
+                    </button>
+                </form>
+            </Modal>
+
+            {/* Convert FitPass / H4 balance modal */}
+            <Modal
+                isOpen={!!divisionConversion}
+                onClose={() => !submittingAction && setDivisionConversion(null)}
+                title={`Convert Member: ${divisionConversion?.member?.name || ''}`}
+            >
+                {loadingConversion || !divisionConversion?.options ? (
+                    <p style={{ color: 'var(--text-secondary)' }}>Loading balances and conversion rates…</p>
+                ) : (() => {
+                    const { options } = divisionConversion;
+                    const isFitPassSource = options.sourceDivision === 'fitpass';
+                    const sourceLabel = isFitPassSource ? 'FitPass coins to convert' : 'H4 days to convert';
+                    const targetLabel = isFitPassSource ? 'H4 membership days' : 'FitPass coins';
+                    const maximum = isFitPassSource ? options.fitpassCoinBalance : options.h4DaysRemaining;
+                    const targetPlans = divisionConversion.targetDivision === 'h4' ? options.h4Plans : options.fitpassPlans;
+                    return <form onSubmit={handleConvertDivision}>
+                        <div style={{ padding: 12, marginBottom: 16, borderRadius: 10, background: 'var(--bg-tertiary, #f7f5ef)', color: 'var(--text-secondary)', fontSize: 13 }}>
+                            Current division: <strong>{options.sourceDivision.toUpperCase()}</strong> · Available to convert: <strong>{maximum} {isFitPassSource ? 'FitCoins' : 'days'}</strong>
+                        </div>
+
+                        <div className="input-group">
+                            <label>Target membership plan *</label>
+                            <select className="input" value={divisionConversion.targetPlanId} onChange={e => updateConversionPlan(e.target.value)} required>
+                                <option value="">Choose a {divisionConversion.targetDivision === 'h4' ? 'H4' : 'FitPass'} plan</option>
+                                {targetPlans.map(plan => <option key={plan.id} value={plan.id}>{plan.name} · ₹{Number(plan.price || 0).toLocaleString('en-IN')} / {plan.duration} {plan.durationUnit || 'days'}</option>)}
+                            </select>
+                        </div>
+
+                        {divisionConversion.targetDivision === 'h4' && <div className="input-group">
+                            <label>H4 branch</label>
+                            <select className="input" value={divisionConversion.targetBranchId} onChange={e => setDivisionConversion(current => ({ ...current, targetBranchId: e.target.value }))}>
+                                <option value="">H4 main membership</option>
+                                {options.h4Branches.map(branch => <option key={branch.id} value={branch.id}>{branch.name}{branch.address ? ` · ${branch.address}` : ''}</option>)}
+                            </select>
+                        </div>}
+
+                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 12 }}>
+                            <div className="input-group">
+                                <label>{sourceLabel} (max {maximum})</label>
+                                <input className="input" type="number" min="1" max={maximum} step="1" value={divisionConversion.sourceAmount} onChange={e => updateConversionSource(e.target.value)} required />
+                            </div>
+                            <div className="input-group">
+                                <label>{targetLabel}</label>
+                                <input className="input" type="number" min="1" step="1" value={divisionConversion.targetAmount} onChange={e => updateConversionTarget(e.target.value)} required />
+                            </div>
+                        </div>
+
+                        <div className="input-group">
+                            <label>Conversion rate · FitCoins per H4 day</label>
+                            <input className="input" type="number" min="0.01" max="100000" step="0.01" value={divisionConversion.coinsPerH4Day} onChange={e => updateConversionRate(e.target.value)} required />
+                            <small style={{ color: 'var(--text-secondary)' }}>Suggested from the source member’s plan value and target plan price per day or FitCoin allowance. Edit it to adjust either amount.</small>
+                        </div>
+
+                        {maximum > Number(divisionConversion.sourceAmount) && <p style={{ margin: '0 0 12px', color: '#9a6700', fontSize: 13 }}>
+                            {isFitPassSource
+                                ? `${maximum - Number(divisionConversion.sourceAmount)} FitCoins will remain on the H4 profile and cannot be spent until converted back.`
+                                : `${maximum - Number(divisionConversion.sourceAmount)} remaining H4 day(s) will not carry over when the H4 membership ends.`}
+                        </p>}
+
+                        <p style={{ margin: '0.5rem 0 0', color: 'var(--text-secondary)', fontSize: 12 }}>
+                            Conversion amounts round to whole days or FitCoins. The converted value is recorded as membership credit, not a cash payment. FitPass check-in sessions are set from the resulting coin balance using the current coin-per-check-in setting ({options.coinsPerCheckIn} coins per session).
+                        </p>
+                        <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: '1.25rem' }} disabled={submittingAction || !targetPlans.length}>
+                            {submittingAction ? 'Converting member…' : `Convert to ${divisionConversion.targetDivision === 'h4' ? 'H4' : 'FitPass'}`}
+                        </button>
+                    </form>;
+                })()}
+            </Modal>
+
+            {/* Transfer Branch Modal */}
+            <Modal isOpen={!!transferMemberData} onClose={() => setTransferMemberData(null)} title={` Transfer Branch: ${transferMemberData?.name}`}>
+                <form onSubmit={async (e) => {
+                    e.preventDefault();
+                    setSubmittingAction(true);
+                    try {
+                        await API.put(`/members/${transferMemberData._id}/transfer`, { targetBranchId: transferBranchId });
+                        setTransferMemberData(null);
+                        fetchData();
+                    } catch (err) {
+                        alert(err.response?.data?.message || 'Failed to transfer branch');
+                    } finally {
+                        setSubmittingAction(false);
+                    }
+                }}>
+                    <div className="input-group">
+                        <label>Target Gym Branch *</label>
+                        <select
+                            className="input"
+                            value={transferBranchId}
+                            onChange={(e) => setTransferBranchId(e.target.value)}
+                        >
+                            <option value="">No Branch (Global Gym Access)</option>
+                            {branches.map(b => (
+                                <option key={b._id} value={b._id}> {b.name} — {b.address || 'Main Location'}</option>
+                            ))}
+                        </select>
+                    </div>
+
+                    <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.5rem' }}>
+                        Transferring this member updates their branch assignment for attendance, trainer assignments, and revenue reports.
+                    </p>
+
+                    <button type="submit" className="btn btn-primary" style={{ width: '100%', marginTop: '1.5rem' }} disabled={submittingAction}>
+                        {submittingAction ? 'Transferring...' : 'Confirm Branch Transfer'}
+                    </button>
+                </form>
+            </Modal>
+        </div>
+    );
+};
+
+export default Members;
+

@@ -1,0 +1,54 @@
+{
+  "expo": {
+    "name": "Gym CRM",
+    "slug": "gym-crm",
+    "owner": "rifle117",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/fitprime-icon.png",
+    "userInterfaceStyle": "light",
+    "scheme": "gymcrm",
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Gym CRM to use a photo for your member profile."
+        }
+      ],
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "usesCleartextTraffic": true
+          }
+        }
+      ],
+      "expo-status-bar"
+    ],
+    "ios": {
+      "supportsTablet": true
+    },
+    "android": {
+      "adaptiveIcon": {
+        "backgroundColor": "#090909",
+        "foregroundImage": "./assets/fitprime-icon.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "package": "com.marcos.gymcrm",
+      "permissions": [
+        "android.permission.RECORD_AUDIO"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/fitprime-icon.png"
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "fbc94e3f-f808-4e0c-9377-55f749d6b645"
+      }
+    }
+  }
+}

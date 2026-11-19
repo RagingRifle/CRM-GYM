@@ -1,0 +1,227 @@
+import { createContext, useState, useEffect } from 'react';
+import API from '../services/api';
+
+export const AuthContext = createContext();
+
+export const AuthProvider = ({ children }) => {
+    const [user, setUser] = useState(null);
+    const [loading, setLoading] = useState(true);
+    const [selectedGymId, setSelectedGymId] = useState(() => {
+        return sessionStorage.getItem('selectedGymId') || '';
+    });
+    const [selectedBranchId, setSelectedBranchId] = useState(() => {
+        return sessionStorage.getItem('selectedBranchId') || '';
+    });
+    const [activeDivision, setActiveDivision] = useState(() => {
+        return sessionStorage.getItem('activeDivision') || 'h4';
+    });
+
+    useEffect(() => {
+        // Migrate the previous shared browser-wide auth state into this tab once.
+        // Removing the legacy keys prevents other tabs from reusing this session.
+        ['user', 'token', 'selectedGymId', 'selectedBranchId', 'activeDivision'].forEach((key) => {
+            const legacyValue = localStorage.getItem(key);
+            if (!sessionStorage.getItem(key) && legacyValue !== null) sessionStorage.setItem(key, legacyValue);
+            localStorage.removeItem(key);
+        });
+        setSelectedGymId(sessionStorage.getItem('selectedGymId') || '');
+        setSelectedBranchId(sessionStorage.getItem('selectedBranchId') || '');
+        setActiveDivision('h4');
+
+        const storedUser = sessionStorage.getItem('user');
+        const token = sessionStorage.getItem('token');
+        if (storedUser && token) {
+            const parsedUser = JSON.parse(storedUser);
+            setUser(parsedUser);
+
+            if (parsedUser.role === 'superadmin' && !sessionStorage.getItem('selectedGymId')) {
+                API.get('/superadmin/h4-gym').then(({ data: gym }) => {
+                    const gymId = gym?._id || gym?.id;
+                    if (gymId) {
+                        sessionStorage.setItem('selectedGymId', gymId);
+                        setSelectedGymId(gymId);
+                    }
+                }).catch(() => {});
+            }
+            
+            let division = 'h4';
+            if (parsedUser.role === 'superadmin') {
+                if (window.location.pathname === '/dashboard') {
+                    division = 'h4';
+                    if (!sessionStorage.getItem('selectedGymId')) {
+                        API.get('/superadmin/h4-gym').then(({ data: h4Gym }) => {
+                            const h4Id = h4Gym?._id || h4Gym?.id;
+                            if (h4Id) {
+                                sessionStorage.setItem('selectedGymId', h4Id);
+                                setSelectedGymId(h4Id);
+                            }
+                        }).catch(() => {});
+                    }
+                }
+            } else if (parsedUser.role === 'h4_admin' || (parsedUser.gymName && parsedUser.gymName.toUpperCase() === 'H4') || ['05a08fdf-7427-48a5-8b25-e18d5a5668cd', '327d37e7-f978-43a9-82ef-e6c4a4dc3c5d'].includes(String(parsedUser.gymId?._id || parsedUser.gymId || ''))) {
+                division = 'h4';
+            }
+            if (division) {
+                sessionStorage.setItem('activeDivision', division);
+                setActiveDivision(division);
+            }
+        }
+        setLoading(false);
+    }, []);
+
+    const login = async (email, password, selectedRole) => {
+        try {
+            const portalType = selectedRole;
+            const { data } = await API.post('/auth/login', { email, password, portalType });
+
+            const roleMatches = (selRole, userRole, gymName, gymId) => {
+                if (!selRole) return true;
+                if (selRole === 'superadmin') return userRole === 'superadmin';
+                if (selRole === 'h4_admin') return userRole === 'h4_admin';
+                if (selRole === 'h4_gym_admin') {
+                    return userRole === 'h4_admin' || userRole === 'admin';
+                }
+                if (selRole === 'staff') return ['receptionist', 'trainer'].includes(userRole);
+                if (selRole === 'h4_member') {
+                    return userRole === 'member';
+                }
+                if (selRole === 'member') return userRole === 'member';
+                return false;
+            };
+
+            if (selectedRole && !roleMatches(selectedRole, data.role, data.gymName, data.gymId)) {
+                const readableRoleName = 
+                    selectedRole === 'superadmin' ? 'Super Admin' :
+                    selectedRole === 'h4_admin' ? 'Gym CRM Admin' :
+                    selectedRole === 'h4_gym_admin' ? 'Gym CRM Admin' :
+                    selectedRole === 'staff' ? 'Gym Staff / Trainer' :
+                    selectedRole === 'h4_member' ? 'H4 Member' :
+                    'Member';
+                return { 
+                    success: false, 
+                    message: `Access Denied: Your account is not authorized as a ${readableRoleName}.` 
+                };
+            }
+
+            setUser(data);
+            sessionStorage.setItem('user', JSON.stringify(data));
+            sessionStorage.setItem('token', data.token);
+
+            const gymWorkspace = data.role === 'superadmin'
+                ? await API.get('/superadmin/h4-gym').then(({ data: gym }) => gym).catch(() => null)
+                : null;
+            
+            let division = 'h4';
+            if (data.role === 'h4_admin' || (data.gymName && data.gymName.toUpperCase() === 'H4') || ['05a08fdf-7427-48a5-8b25-e18d5a5668cd', '327d37e7-f978-43a9-82ef-e6c4a4dc3c5d'].includes(String(data.gymId?._id || data.gymId || ''))) {
+                division = 'h4';
+            }
+            sessionStorage.setItem('activeDivision', division);
+            setActiveDivision(division);
+
+            if (data.role === 'superadmin') {
+                const gymId = gymWorkspace?._id || gymWorkspace?.id || '';
+                if (gymId) sessionStorage.setItem('selectedGymId', gymId);
+                sessionStorage.removeItem('selectedBranchId');
+                setSelectedGymId(gymId);
+                setSelectedBranchId('');
+            } else if (data.gymId) {
+                sessionStorage.setItem('selectedGymId', data.gymId);
+                setSelectedGymId(data.gymId);
+            } else {
+                sessionStorage.removeItem('selectedGymId');
+                setSelectedGymId('');
+            }
+            if (data.branchId) {
+                sessionStorage.setItem('selectedBranchId', data.branchId);
+                setSelectedBranchId(data.branchId);
+            } else {
+                sessionStorage.removeItem('selectedBranchId');
+                setSelectedBranchId('');
+            }
+            return { success: true, user: data };
+        } catch (error) {
+            return { success: false, message: error.response?.data?.message || 'Login failed' };
+        }
+    };
+ 
+    const register = async (name, email, password, phone) => {
+        try {
+            const { data } = await API.post('/auth/register', { name, email, password, phone });
+            return { success: true, email: data.email || email };
+        } catch (error) {
+            return { success: false, message: error.response?.data?.message || 'Registration failed' };
+        }
+    };
+
+    const verifyRegistration = async (email, otp) => {
+        try {
+            const { data } = await API.post('/auth/verify-otp', { email, otp });
+            setUser(data);
+            sessionStorage.setItem('user', JSON.stringify(data));
+            sessionStorage.setItem('token', data.token);
+            if (data.gymId) { sessionStorage.setItem('selectedGymId', data.gymId); setSelectedGymId(data.gymId); }
+            return { success: true, user: data };
+        } catch (error) {
+            return { success: false, message: error.response?.data?.message || 'Verification failed' };
+        }
+    };
+
+    const logout = () => {
+        setUser(null);
+        setSelectedGymId('');
+        setSelectedBranchId('');
+        sessionStorage.removeItem('user');
+        sessionStorage.removeItem('token');
+        sessionStorage.removeItem('selectedGymId');
+        sessionStorage.removeItem('selectedBranchId');
+    };
+
+    const updateUserLocal = (updates) => setUser((current) => {
+        const next = { ...current, ...updates };
+        sessionStorage.setItem('user', JSON.stringify(next));
+        return next;
+    });
+
+    const changeSelectedGym = (gymId) => {
+        setSelectedGymId(gymId);
+        if (gymId) {
+            sessionStorage.setItem('selectedGymId', gymId);
+        } else {
+            sessionStorage.removeItem('selectedGymId');
+        }
+    };
+
+    const changeSelectedBranch = (branchId) => {
+        setSelectedBranchId(branchId);
+        if (branchId) {
+            sessionStorage.setItem('selectedBranchId', branchId);
+        } else {
+            sessionStorage.removeItem('selectedBranchId');
+        }
+    };
+
+    const changeActiveDivision = (division) => {
+        setActiveDivision(division);
+        sessionStorage.setItem('activeDivision', division);
+    };
+
+    return (
+        <AuthContext.Provider value={{ 
+            user, 
+            updateUserLocal,
+            loading, 
+            login, 
+            register, 
+            verifyRegistration,
+            logout, 
+            selectedGymId, 
+            changeSelectedGym, 
+            selectedBranchId,
+            changeSelectedBranch,
+            activeDivision, 
+            changeActiveDivision 
+        }}>
+            {children}
+        </AuthContext.Provider>
+    );
+};

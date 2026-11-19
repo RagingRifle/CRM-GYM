@@ -1,0 +1,975 @@
+const catchAsync = require('../utils/catchAsync');
+const AppError = require('../utils/appError');
+const Member = require('../models/Member');
+const Plan = require('../models/Plan');
+const User = require('../models/User');
+const MemberTrainerAssignment = require('../models/MemberTrainerAssignment');
+const prisma = require('../config/prisma');
+const { jsonToCsv } = require('../utils/csvUtils');
+const { logAudit } = require('../utils/auditLogger');
+const { H4_GYM_IDS } = require('../config/constants');
+const { dedupeMembers } = require('../utils/memberIdentity');
+const { z } = require('zod');
+const getPlanDurationDays = (plan) => {
+    const duration = Number(plan?.duration) || 0;
+    const unit = String(plan?.durationUnit || 'days').toLowerCase();
+    if (unit.startsWith('month')) return duration * 30;
+    if (unit.startsWith('year')) return duration * 365;
+    if (unit.startsWith('hour')) return duration / 24;
+    return duration;
+};
+
+const getMemberDivisionConversionOptions = catchAsync(async (req, res) => {
+    const member = await prisma.member.findUnique({ where: { id: req.params.id } });
+    if (!member) return res.status(404).json({ success: false, message: 'Member not found.' });
+
+    const h4Gym = await prisma.gym.findFirst({ where: { name: { equals: 'H4', mode: 'insensitive' } } });
+    const h4GymId = h4Gym?.id || H4_GYM_IDS[0];
+    const h4GymIds = [...new Set([...H4_GYM_IDS, h4GymId])];
+    const [sourcePlan, fitpassPlans, h4Plans, branches, coinSettings] = await Promise.all([
+        member.planId ? prisma.plan.findUnique({ where: { id: member.planId } }) : null,
+        prisma.plan.findMany({ where: { gymId: 'SYSTEM', sessions: { gt: 0 } }, orderBy: { price: 'asc' } }),
+        prisma.plan.findMany({
+            where: { OR: [
+                { gymId: { in: h4GymIds } },
+                { gymId: 'SYSTEM', sessions: null },
+                { gymId: 'SYSTEM', sessions: 0 },
+            ] },
+            orderBy: { price: 'asc' },
+        }),
+        prisma.branch.findMany({ where: { gymId: h4GymId }, orderBy: { name: 'asc' }, select: { id: true, name: true, address: true } }),
+        prisma.coinSettings.findUnique({ where: { division: 'fitpass' } }).catch(() => null),
+    ]);
+    const gym = member.gymId === 'SYSTEM' ? null : await prisma.gym.findUnique({ where: { id: member.gymId } }).catch(() => null);
+    const sourceDivision = member.gymId === 'SYSTEM' ? 'fitpass' : (H4_GYM_IDS.includes(String(member.gymId)) || String(gym?.name || '').toLowerCase() === 'h4') ? 'h4' : null;
+    if (!sourceDivision) return res.status(400).json({ success: false, message: 'Only FitPass and H4 members can be converted.' });
+
+    const coinsPerCheckIn = Number(coinSettings?.coinsPerSession) || 10;
+    const fitpassCoinBalance = sourceDivision === 'fitpass'
+        ? Math.max(0, Number(member.fitpassCoins || 0) + (!member.coinsMigrated ? Number(member.sessionsRemaining || 0) * coinsPerCheckIn : 0))
+        : Number(member.fitpassCoins || 0);
+    const now = new Date();
+    const h4DaysRemaining = sourceDivision === 'h4' && member.expiryDate && new Date(member.expiryDate) > now
+        ? Math.ceil((new Date(member.expiryDate) - now) / 86_400_000)
+        : 0;
+    const h4DailyPrices = h4Plans.filter(plan => Number(plan.sessions || 0) <= 0 && getPlanDurationDays(plan) > 0 && Number(plan.price) > 0)
+        .map(plan => Number(plan.price) / getPlanDurationDays(plan)).sort((a, b) => a - b);
+    const h4DailyValue = h4DailyPrices.length ? h4DailyPrices[Math.floor(h4DailyPrices.length / 2)] : 33.3;
+    const fitpassCoinPrices = fitpassPlans.map(plan => {
+        const allowance = Number(plan.coinAllowance) > 0 ? Number(plan.coinAllowance) : Number(plan.sessions || 0) * coinsPerCheckIn;
+        return allowance > 0 ? Number(plan.price || 0) / allowance : 0;
+    }).filter(value => value > 0);
+    const fitpassCoinValue = fitpassCoinPrices.length
+        ? fitpassCoinPrices.reduce((sum, value) => sum + value, 0) / fitpassCoinPrices.length
+        : 5;
+    const sourcePlanDuration = getPlanDurationDays(sourcePlan) || 30;
+    const sourcePlanPrice = Number(member.planPrice) > 0 ? Number(member.planPrice) : Number(sourcePlan?.price || 0);
+    const sourceCoinAllowance = Number(sourcePlan?.coinAllowance) > 0
+        ? Number(sourcePlan.coinAllowance)
+        : Number(sourcePlan?.sessions || 0) * coinsPerCheckIn;
+    const suggestedCoinsPerH4Day = sourceDivision === 'fitpass' && sourceCoinAllowance > 0 && sourcePlanPrice > 0
+        ? h4DailyValue / (sourcePlanPrice / sourceCoinAllowance)
+        : sourceDivision === 'h4' && sourcePlanPrice > 0
+            ? (sourcePlanPrice / sourcePlanDuration) / fitpassCoinValue
+            : h4DailyValue / fitpassCoinValue;
+
+    res.json({
+        success: true,
+        sourceDivision,
+        sourcePlan,
+        sourcePlanPrice: Number(member.planPrice) || 0,
+        fitpassCoinBalance,
+        h4DaysRemaining,
+        coinsPerCheckIn,
+        suggestedCoinsPerH4Day: Math.max(0.01, Number(suggestedCoinsPerH4Day.toFixed(2))),
+        fitpassPlans,
+        h4Plans: h4Plans.filter(plan => Number(plan.sessions || 0) <= 0),
+        h4GymId,
+        h4Branches: branches,
+    });
+});
+
+const convertMemberDivision = catchAsync(async (req, res) => {
+    const schema = z.object({
+        targetDivision: z.enum(['h4', 'fitpass']),
+        targetPlanId: z.string().min(1),
+        targetBranchId: z.string().optional().nullable(),
+        sourceAmount: z.coerce.number().int().positive(),
+        coinsPerH4Day: z.coerce.number().positive().max(100000),
+    });
+    const parsed = schema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ success: false, message: parsed.error.issues[0]?.message || 'Invalid conversion details.' });
+    const { targetDivision, targetPlanId, targetBranchId, sourceAmount, coinsPerH4Day } = parsed.data;
+    const member = await prisma.member.findUnique({ where: { id: req.params.id } });
+    if (!member) return res.status(404).json({ success: false, message: 'Member not found.' });
+
+    const h4Gym = await prisma.gym.findFirst({ where: { name: { equals: 'H4', mode: 'insensitive' } } });
+    const h4GymId = h4Gym?.id || H4_GYM_IDS[0];
+    const h4GymIds = [...new Set([...H4_GYM_IDS, h4GymId])];
+    const sourceGym = member.gymId === 'SYSTEM' ? null : await prisma.gym.findUnique({ where: { id: member.gymId } }).catch(() => null);
+    const sourceDivision = member.gymId === 'SYSTEM' ? 'fitpass' : (H4_GYM_IDS.includes(String(member.gymId)) || String(sourceGym?.name || '').toLowerCase() === 'h4') ? 'h4' : null;
+    if (!sourceDivision || sourceDivision === targetDivision) return res.status(400).json({ success: false, message: 'This member is not in the opposite division.' });
+
+    const [sourcePlan, targetPlan, coinSettings] = await Promise.all([
+        member.planId ? prisma.plan.findUnique({ where: { id: member.planId } }) : null,
+        prisma.plan.findUnique({ where: { id: targetPlanId } }),
+        prisma.coinSettings.findUnique({ where: { division: 'fitpass' } }).catch(() => null),
+    ]);
+    const coinsPerCheckIn = Number(coinSettings?.coinsPerSession) || 10;
+    if (targetDivision === 'h4') {
+        const legacyH4Plan = targetPlan?.gymId === 'SYSTEM' && Number(targetPlan.sessions || 0) <= 0;
+        if (!targetPlan || (!h4GymIds.includes(String(targetPlan.gymId)) && !legacyH4Plan) || Number(targetPlan.sessions || 0) > 0) {
+            return res.status(400).json({ success: false, message: 'Choose a valid H4 membership plan.' });
+        }
+    } else if (!targetPlan || targetPlan.gymId !== 'SYSTEM' || Number(targetPlan.sessions || 0) <= 0) {
+        return res.status(400).json({ success: false, message: 'Choose a valid FitPass plan.' });
+    }
+
+    let targetAmount;
+    let targetGymId;
+    let branchId = null;
+    const now = new Date();
+    if (targetDivision === 'h4') {
+        const currentBalance = Math.max(0, Number(member.fitpassCoins || 0) + (!member.coinsMigrated ? Number(member.sessionsRemaining || 0) * coinsPerCheckIn : 0));
+        if (sourceAmount > currentBalance) return res.status(400).json({ success: false, message: `You can convert up to ${currentBalance} FitCoins.` });
+        targetAmount = Math.round(sourceAmount / coinsPerH4Day);
+        if (targetAmount < 1) return res.status(400).json({ success: false, message: 'This coin amount converts to less than one H4 membership day.' });
+        targetGymId = h4GymId;
+        branchId = targetBranchId || null;
+        if (targetPlan.branchId) {
+            if (branchId && String(branchId) !== String(targetPlan.branchId)) {
+                return res.status(400).json({ success: false, message: 'The selected H4 plan belongs to a different branch.' });
+            }
+            branchId = String(targetPlan.branchId);
+        }
+        if (branchId) {
+            const branch = await prisma.branch.findUnique({ where: { id: branchId } });
+            if (!branch || String(branch.gymId) !== String(h4GymId)) return res.status(400).json({ success: false, message: 'Choose a valid H4 branch.' });
+        }
+        if (targetPlan.gymId === 'SYSTEM') {
+            await prisma.plan.update({ where: { id: targetPlan.id }, data: { gymId: targetGymId } });
+            targetPlan.gymId = targetGymId;
+        }
+    } else {
+        const daysRemaining = member.expiryDate && new Date(member.expiryDate) > now
+            ? Math.ceil((new Date(member.expiryDate) - now) / 86_400_000)
+            : 0;
+        if (sourceAmount > daysRemaining) return res.status(400).json({ success: false, message: `You can convert up to ${daysRemaining} remaining H4 days.` });
+        targetAmount = Math.round(sourceAmount * coinsPerH4Day);
+        if (targetAmount < 1) return res.status(400).json({ success: false, message: 'This H4 duration converts to less than one FitCoin.' });
+        targetGymId = 'SYSTEM';
+    }
+
+    const newExpiryDate = new Date(now.getTime() + (targetDivision === 'h4' ? targetAmount : sourceAmount) * 86_400_000);
+    const currentCoins = Number(member.fitpassCoins || 0) + (!member.coinsMigrated && sourceDivision === 'fitpass' ? Number(member.sessionsRemaining || 0) * coinsPerCheckIn : 0);
+    const nextFitpassCoins = targetDivision === 'h4' ? Math.max(0, currentCoins - sourceAmount) : currentCoins + targetAmount;
+    const nextSessions = targetDivision === 'fitpass' ? Math.floor(nextFitpassCoins / coinsPerCheckIn) : 0;
+    const convertedDays = targetDivision === 'h4' ? targetAmount : sourceAmount;
+    const targetPlanCoins = Number(targetPlan.coinAllowance) > 0 ? Number(targetPlan.coinAllowance) : Number(targetPlan.sessions || 0) * coinsPerCheckIn;
+    const conversionValuePerDay = targetDivision === 'h4'
+        ? Number(targetPlan.price || 0) / (getPlanDurationDays(targetPlan) || 30)
+        : (targetPlanCoins > 0 ? Number(targetPlan.price || 0) / targetPlanCoins : 0) * coinsPerH4Day;
+    const conversionCredit = Math.round(convertedDays * conversionValuePerDay * 100) / 100;
+    const updateData = {
+        gymId: targetGymId,
+        branchId,
+        planId: targetPlan.id,
+        joinDate: now,
+        planPrice: conversionCredit,
+        paidAmount: conversionCredit,
+        expiryDate: newExpiryDate,
+        status: 'Active',
+        fitpassCoins: nextFitpassCoins,
+        sessionsTotal: nextSessions,
+        sessionsRemaining: nextSessions,
+        coinsMigrated: true,
+    };
+    const contactFilters = [
+        ...(member.email ? [{ email: { equals: member.email, mode: 'insensitive' } }] : []),
+        ...(member.phone ? [{ phone: member.phone }] : []),
+    ];
+    const userWhere = {
+        role: 'member',
+        OR: [
+            { memberId: member.id },
+            ...(contactFilters.length ? [{ AND: [{ gymId: member.gymId }, { OR: contactFilters }] }] : []),
+        ],
+    };
+    await prisma.$transaction(async tx => {
+        await tx.member.update({ where: { id: member.id }, data: updateData });
+        await tx.user.updateMany({ where: userWhere, data: { gymId: targetGymId, branchId } });
+    });
+
+    const rateText = `${coinsPerH4Day} FitCoins per H4 day`;
+    await logAudit(req, 'MEMBER_DIVISION_SWITCHED', 'Member', member.id,
+        `${member.name} converted from ${sourceDivision.toUpperCase()} to ${targetDivision.toUpperCase()}: ${sourceAmount} ${sourceDivision === 'fitpass' ? 'FitCoins' : 'H4 days'} -> ${targetAmount} ${targetDivision === 'fitpass' ? 'FitCoins' : 'H4 days'} at ${rateText}; plan ${targetPlan.name}; converted plan credit ₹${conversionCredit}.`, member.name);
+
+    res.json({ success: true, member: await prisma.member.findUnique({ where: { id: member.id } }), sourceAmount, targetAmount, targetDivision });
+});
+
+const migrateLegacyH4Plan = async (plan, targetGymId) => {
+    if (!plan || plan.gymId !== 'SYSTEM' || Number(plan.sessions) > 0 || !(Number(plan.duration) > 0)) return false;
+    const gymId = String(targetGymId || '');
+    let isH4 = H4_GYM_IDS.includes(gymId);
+    if (!isH4 && gymId) {
+        const Gym = require('../models/Gym');
+        const gym = await Gym.findById(gymId).lean();
+        isH4 = String(gym?.name || '').toLowerCase().includes('h4');
+    }
+    if (!isH4) return false;
+    plan.gymId = gymId;
+    await plan.save();
+    return true;
+};
+
+// Helper to dynamically build member query based on role restrictions
+const buildMemberQuery = async (req, memberId) => {
+    const query = { ...req.tenantFilter };
+    if (memberId) {
+        query._id = memberId;
+    }
+
+    if (req.user.role === 'superadmin') {
+        const selectedGymId = String(req.tenantFilter?.gymId || '');
+        if (H4_GYM_IDS.includes(selectedGymId)) {
+            query.gymId = selectedGymId;
+        }
+        return query;
+    }
+
+    if (req.user.role === 'trainer') {
+        const assignments = await MemberTrainerAssignment.find({ trainerId: req.user.id, gymId: req.user.gymId }).select('memberId').lean();
+        const assignedIds = assignments.map((assignment) => String(assignment.memberId));
+        if (memberId) return assignedIds.includes(String(memberId)) ? { ...query, _id: memberId } : { _id: '__not_assigned__' };
+        query._id = { $in: assignedIds };
+        return query;
+    }
+
+    const currentGymId = String(req.user.gymId || '');
+    const isH4Scope = req.user.role === 'h4_admin' || H4_GYM_IDS.includes(currentGymId);
+    if (isH4Scope) {
+        query.gymId = { $in: [...new Set([...H4_GYM_IDS, currentGymId].filter(Boolean))] };
+        if (req.user.branchId) query.branchId = req.user.branchId;
+        return query;
+    }
+
+    if (req.user.role === 'fitpass_admin') {
+        const Gym = require('../models/Gym');
+        const h4Gym = await Gym.findOne({ name: 'H4' });
+        const h4GymId = h4Gym ? h4Gym._id.toString() : H4_GYM_IDS[0];
+        if (req.user.gymId && req.user.gymId !== 'SYSTEM') {
+            query.gymId = req.user.gymId;
+        } else if (!query.gymId) {
+            query.gymId = { $ne: h4GymId };
+        }
+    }
+    return query;
+};
+
+// @desc    Create a new member
+// @route   POST /api/members
+// @access  Private/Admin
+const createMember = catchAsync(async (req, res, next) => {
+    try {
+        const { name, phone, email, planId, joinDate, branchId, gymId } = req.body;
+
+        const selectedGymId = String(req.tenantFilter?.gymId || '');
+        const isH4Registration = req.user.role === 'h4_admin'
+            || H4_GYM_IDS.includes(String(req.user.gymId || ''))
+            || (req.user.role === 'superadmin' && H4_GYM_IDS.includes(selectedGymId));
+        if (!name || !phone || (!planId && !isH4Registration)) {
+            res.status(400);
+            return res.json({ success: false, message: isH4Registration ? 'Name and phone are required' : 'Name, phone, and plan are required' });
+        }
+
+        const plan = planId ? await Plan.findById(planId) : null;
+        if (planId && !plan) {
+            res.status(404);
+            return res.json({ success: false, message: 'Plan not found' });
+        }
+
+        // Check if a user with this email or generated email already exists to prevent unique constraint crash
+        const emailCheck = email ? email : `${phone}@gym.com`;
+        const existingUser = await User.findOne({ email: emailCheck });
+        if (existingUser) {
+            res.status(400);
+            return res.json({ 
+                success: false, 
+                message: `A user or member with the email or phone number (${emailCheck}) already exists` 
+            });
+        }
+
+        const startDate = joinDate ? new Date(joinDate) : new Date();
+        const requestedDurationDays = Number(req.body.durationDays);
+        const durationDays = plan
+            ? Number(plan.duration) || Number(plan.validityDays) || 30
+            : Number.isFinite(requestedDurationDays) && requestedDurationDays > 0
+                ? Math.floor(requestedDurationDays)
+                : 30;
+        const expiryDate = new Date(startDate);
+        expiryDate.setUTCDate(expiryDate.getUTCDate() + durationDays);
+
+        const status = expiryDate && expiryDate < new Date() ? 'Expired' : 'Active';
+
+        let targetGymId;
+        if (req.user.gymId && req.user.gymId !== 'SYSTEM') {
+            targetGymId = req.user.gymId;
+        } else if (gymId) {
+            targetGymId = gymId;
+        } else if (isH4Registration && selectedGymId) {
+            targetGymId = selectedGymId;
+        } else if (plan && plan.gymId && plan.gymId !== 'SYSTEM') {
+            targetGymId = plan.gymId;
+        } else if (plan && plan.gymId === 'SYSTEM') {
+            targetGymId = 'SYSTEM';
+        } else if (req.tenantFilter && req.tenantFilter.gymId) {
+            targetGymId = req.tenantFilter.gymId;
+        } else {
+            const Gym = require('../models/Gym');
+            const h4Gym = await Gym.findOne({ name: 'H4' });
+            targetGymId = h4Gym ? h4Gym._id.toString() : H4_GYM_IDS[0];
+        }
+
+        if (plan?.gymId === 'SYSTEM' && Number(plan.sessions) <= 0) {
+            await migrateLegacyH4Plan(plan, targetGymId);
+        }
+        if (plan?.gymId === 'SYSTEM') {
+            const fitPassAdminCreate = req.user.role === 'fitpass_admin'
+                || (req.user.role === 'superadmin' && String(gymId || '') === 'SYSTEM');
+            if (!fitPassAdminCreate || String(targetGymId) !== 'SYSTEM' || !(Number(plan.sessions) > 0)) {
+                return res.status(400).json({ success: false, message: 'FitPass session plans are reserved for FitPass members. Use a gym membership plan for H4 registration.' });
+            }
+        }
+        if (plan && String(plan.gymId) !== String(targetGymId)) {
+            return res.status(403).json({ success: false, message: 'This plan belongs to a different gym. Choose a plan from the member’s gym.' });
+        }
+
+        const duplicateContactConditions = [];
+        if (email?.trim()) duplicateContactConditions.push({ email: { equals: email.trim(), mode: 'insensitive' } });
+        if (phone?.trim()) duplicateContactConditions.push({ phone: phone.trim() });
+        const existingMember = duplicateContactConditions.length
+            ? await prisma.member.findFirst({ where: { gymId: targetGymId, OR: duplicateContactConditions }, select: { id: true, name: true } })
+            : null;
+        if (existingMember) {
+            return res.status(409).json({ success: false, message: `${existingMember.name} already has a member record in this scope. Update that record instead of creating a duplicate.` });
+        }
+
+        const targetBranchId = req.user.branchId || branchId || null;
+        if (plan?.branchId && String(plan.branchId) !== String(targetBranchId || '')) {
+            return res.status(403).json({ success: false, message: 'This plan is assigned to a different branch.' });
+        }
+
+        const numericDiscount = Math.max(0, Number(req.body.discount) || 0);
+        const catalogPrice = Number(plan?.price) || 0;
+        const netAgreedPrice = req.body.finalPrice !== undefined && req.body.finalPrice !== null && req.body.finalPrice !== ''
+            ? Math.max(0, Number(req.body.finalPrice))
+            : Math.max(0, catalogPrice - numericDiscount);
+
+        const numericPaid = Number(req.body.paidAmount) || 0;
+
+        const { allocateMemberCode } = require('../utils/idGenerator');
+        const memberCode = await allocateMemberCode();
+        const isH4Member = H4_GYM_IDS.includes(String(targetGymId));
+        const assignedSessions = Number(plan?.sessions) || 0;
+        const coinConfig = assignedSessions > 0 && !isH4Member ? await prisma.coinSettings.findUnique({ where: { division: 'fitpass' } }).catch(() => null) : null;
+        const member = await Member.create({
+            registrationNumber: memberCode,
+            name,
+            phone,
+            email: email || null,
+            planId: plan?._id || null,
+            joinDate: startDate,
+            expiryDate,
+            status,
+            planPrice: netAgreedPrice,
+            paidAmount: numericPaid,
+            ...(assignedSessions > 0 ? {
+                sessionsRemaining: assignedSessions,
+                sessionsTotal: assignedSessions,
+                ...(!isH4Member ? { fitpassCoins: assignedSessions * (coinConfig?.coinsPerSession || 10), coinsMigrated: true } : {}),
+            } : {}),
+            gymId: targetGymId,
+            branchId: targetBranchId
+        });
+
+        if (member && req.user.role === 'h4_admin' && targetBranchId) {
+            const trainers = await User.find({ gymId: targetGymId, branchId: targetBranchId, role: 'trainer', isActive: true }).lean();
+            const loads = await Promise.all(trainers.map(async (trainer) => ({
+                trainer,
+                count: await MemberTrainerAssignment.countDocuments({ trainerId: trainer._id || trainer.id, gymId: targetGymId })
+            })));
+            const availableTrainer = loads.filter(({ trainer, count }) => count < (trainer.trainerMemberLimit || 10)).sort((a, b) => a.count - b.count)[0]?.trainer;
+            if (availableTrainer) await MemberTrainerAssignment.create({ memberId: member._id || member.id, trainerId: availableTrainer._id || availableTrainer.id, gymId: targetGymId, branchId: targetBranchId });
+        }
+
+        if (member) {
+            // Create a User record for the member to allow login
+            // Default password is password param or phone number
+            const { password, paymentMethod = 'Cash' } = req.body;
+            const salesStaff = req.body.salesStaffId
+                ? await User.findOne({ _id: req.body.salesStaffId, gymId: targetGymId }).lean() || await User.findOne({ name: req.body.salesStaffId, gymId: targetGymId }).lean()
+                : null;
+            const leadRecord = req.body.leadId
+                ? await require('../models/Lead').findOne({ _id: req.body.leadId, gymId: targetGymId }).lean()
+                : null;
+            await User.create({
+                name: member.name,
+                email: emailCheck,
+                password: password || member.phone,
+                phone: member.phone,
+                role: 'member',
+                memberId: member._id,
+                gymId: targetGymId,
+                branchId: targetBranchId
+            });
+
+            // If an upfront payment was made during registration, record it in the payment ledger
+            const Payment = require('../models/Payment');
+            await Payment.create({
+                memberId: member._id,
+                amount: numericPaid,
+                method: paymentMethod,
+                date: startDate,
+                gymId: targetGymId,
+                branchId: targetBranchId,
+                saleType: 'NEW_MEMBER',
+                source: req.body.saleSource || leadRecord?.source || '',
+                staffId: salesStaff?._id || req.user.id || req.user._id || null,
+                staffName: salesStaff?.name || req.user.name || '',
+                leadId: leadRecord?._id || null
+            });
+
+            await logAudit(
+                req,
+                'MEMBER_REGISTERED',
+                'Member',
+                member._id,
+                `Registered new member ${member.name}${plan ? ` with plan '${plan.name}'` : ' without a subscription plan'} (Catalogue: ₹${catalogPrice}, Discount: ₹${numericDiscount}, Net Fee: ₹${netAgreedPrice}, Paid Upfront: ₹${numericPaid})`,
+                member.name
+            );
+
+            if (req.body.questionnaire) {
+                const q = req.body.questionnaire;
+                const details = [
+                    q.fitnessGoal && `Goal: ${q.fitnessGoal}`,
+                    q.experienceLevel && `Experience: ${q.experienceLevel}`,
+                    q.workoutFrequency && `Frequency: ${q.workoutFrequency}`,
+                    q.dietPreference && `Diet: ${q.dietPreference}`,
+                    q.medicalHistory && `Medical: ${q.medicalHistory}`,
+                    (q.emergencyContactName || q.emergencyContactPhone) && `Emergency: ${q.emergencyContactName || ''} (${q.emergencyContactPhone || ''})`,
+                    q.specialNotes && `Notes: ${q.specialNotes}`
+                ].filter(Boolean).join(' | ');
+
+                if (details) {
+                    await logAudit(
+                        req,
+                        'MEMBER_ASSESSMENT',
+                        'Member',
+                        member._id,
+                        `Onboarding Assessment Questionnaire: ${details}`,
+                        member.name
+                    );
+                }
+            }
+
+            res.status(201).json(member);
+        } else {
+            res.status(400).json({ success: false, message: 'Invalid member data' });
+        }
+    } catch (error) { next(error); }
+});
+
+// @desc    Get all members with pagination and filters
+// @route   GET /api/members
+// @access  Private/Admin
+const getMembers = catchAsync(async (req, res, next) => {
+    try {
+        const { status, search = '' } = req.query;
+        const page = Math.max(1, Number.parseInt(req.query.page, 10) || 1);
+        const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 10));
+
+        const query = await buildMemberQuery(req);
+
+        if (status) query.status = status;
+        if (search) {
+            query.$or = [
+                { name: { $regex: search, $options: 'i' } },
+                { phone: { $regex: search, $options: 'i' } },
+                { email: { $regex: search, $options: 'i' } },
+                { registrationNumber: { $regex: search, $options: 'i' } },
+                { id: { $regex: search, $options: 'i' } }
+            ];
+        }
+
+        const allMatches = await Member.find(query)
+            .populate('planId', 'name price')
+            .sort({ createdAt: -1 })
+            .lean();
+        const uniqueMatches = dedupeMembers(allMatches);
+        const skip = (page - 1) * limit;
+        const total = uniqueMatches.length;
+        const members = uniqueMatches.slice(skip, skip + limit);
+
+        const memberIds = members.map((member) => member._id || member.id);
+        const linkedUsers = memberIds.length
+            ? await User.find({ memberId: { $in: memberIds } }).select('memberId profileImageUrl').lean()
+            : [];
+        const profileImages = new Map(linkedUsers.map((user) => [String(user.memberId), user.profileImageUrl || null]));
+        const branchIds = [...new Set(members.map(member => member.branchId).filter(Boolean).map(String))];
+        const branchRecords = branchIds.length
+            ? await prisma.branch.findMany({ where: { id: { in: branchIds } }, select: { id: true, name: true } })
+            : [];
+        const branchNames = new Map(branchRecords.map(branch => [String(branch.id), branch.name]));
+
+        const { getMemberCode } = require('../utils/idGenerator');
+        const formattedMembers = members.map((m, idx) => ({
+            ...m,
+            profileImageUrl: profileImages.get(String(m._id || m.id)) || null,
+            branchName: m.branchId ? branchNames.get(String(m.branchId)) || null : null,
+            empid: m.registrationNumber || getMemberCode(m, skip + idx),
+            displayId: m.registrationNumber || getMemberCode(m, skip + idx)
+        }));
+
+        res.json({
+            members: formattedMembers,
+            page: Number(page),
+            pages: Math.ceil(total / limit),
+            total
+        });
+    } catch (error) { next(error); }
+});
+
+// @desc    Get members expiring soon (within 7 days)
+// @route   GET /api/members/expiring-soon
+// @access  Private/Admin
+const getExpiringSoonMembers = catchAsync(async (req, res, next) => {
+    try {
+        const today = new Date();
+        const nextWeek = new Date();
+        nextWeek.setDate(today.getDate() + 7);
+
+        const query = await buildMemberQuery(req);
+        query.status = 'Active';
+        query.expiryDate = { $gte: today, $lte: nextWeek };
+
+        const members = await Member.find(query).populate('planId', 'name price').lean();
+
+        res.json(members);
+    } catch (error) { next(error); }
+});
+
+// @desc    Get single member
+// @route   GET /api/members/:id
+// @access  Private/Admin
+const getPlanById = catchAsync(async (req, res, next) => {
+    // Legacy placeholder
+});
+const getMemberById = catchAsync(async (req, res, next) => {
+    try {
+        const query = await buildMemberQuery(req, req.params.id);
+        const member = await Member.findOne(query)
+            .populate('planId', 'name price')
+            .lean();
+
+        if (member) {
+            res.json(member);
+        } else {
+            res.status(404).json({ success: false, message: 'Member not found' });
+        }
+    } catch (error) { next(error); }
+});
+
+// @desc    Update member
+// @route   PUT /api/members/:id
+// @access  Private/Admin
+const updateMember = catchAsync(async (req, res, next) => {
+    try {
+        const { name, phone, email, planId, status, joinDate, branchId, gymId, password, discount = 0, finalPrice, paidAmount = 0, method = 'Cash' } = req.body;
+
+        const query = await buildMemberQuery(req, req.params.id);
+        const member = await Member.findOne(query);
+
+        if (member) {
+            const oldPhone = member.phone;
+            const originalGymId = member.gymId ? member.gymId.toString() : '';
+
+            if (planId) {
+                const plan = await Plan.findById(planId);
+                const targetGymId = req.user.role === 'superadmin' && gymId ? String(gymId) : String(member.gymId || '');
+                if (plan?.gymId === 'SYSTEM' && Number(plan.sessions) <= 0) await migrateLegacyH4Plan(plan, targetGymId);
+                const isUnchangedFitPassPlan = String(planId) === String(member.planId?.toString()) && member.gymId === 'SYSTEM';
+                if (plan && !isUnchangedFitPassPlan && (plan.gymId === 'SYSTEM' || String(plan.gymId) !== targetGymId)) {
+                    return res.status(403).json({ success: false, message: 'Choose a membership plan from the member’s own division and gym.' });
+                }
+                if (plan?.branchId && member.branchId && String(plan.branchId) !== String(member.branchId)) {
+                    return res.status(403).json({ success: false, message: 'This plan is assigned to a different branch.' });
+                }
+                if (!plan && planId !== member.planId?.toString()) {
+                    return res.status(404).json({ success: false, message: 'Plan not found' });
+                }
+                if (plan) {
+                    member.planId = planId;
+                    const catPrice = Number(plan.price) || 0;
+                    const disc = Math.max(0, Number(discount) || 0);
+                    const netAgreed = finalPrice !== undefined && finalPrice !== null && finalPrice !== ''
+                        ? Math.max(0, Number(finalPrice))
+                        : (disc > 0 ? Math.max(0, catPrice - disc) : (member.planPrice || catPrice));
+
+                    member.planPrice = netAgreed;
+
+                    // Recalculate expiry if plan changes
+                    const startDate = joinDate ? new Date(joinDate) : new Date(member.joinDate);
+                    const expiryDate = new Date(startDate);
+                    expiryDate.setDate(startDate.getDate() + (plan.duration || 30));
+                    member.expiryDate = expiryDate;
+                    member.status = expiryDate < new Date() ? 'Expired' : 'Active';
+
+                    const numericPaid = Number(paidAmount) || 0;
+                    if (numericPaid > 0) {
+                        member.paidAmount = (member.paidAmount || 0) + numericPaid;
+                        const Payment = require('../models/Payment');
+                        await Payment.create({
+                            memberId: member._id,
+                            amount: numericPaid,
+                            method: method || 'Cash',
+                            date: new Date(),
+                            gymId: member.gymId,
+                            branchId: member.branchId || null
+                        });
+                    }
+                }
+            }
+
+            member.name = name || member.name;
+            member.phone = phone || member.phone;
+            member.email = email || member.email;
+            if (status) member.status = status;
+            
+            let divisionSwitched = false;
+            let oldDivision = '';
+            let newDivision = '';
+
+            if ((req.user.role === 'superadmin' || req.user.role === 'fitpass_admin') && gymId && gymId !== originalGymId) {
+                divisionSwitched = true;
+                const Gym = require('../models/Gym');
+                const oldGym = await Gym.findById(originalGymId);
+                const newGym = await Gym.findById(gymId);
+                oldDivision = oldGym ? oldGym.name : 'Unknown Division';
+                newDivision = newGym ? newGym.name : 'Unknown Division';
+                
+                member.gymId = gymId;
+                member.branchId = null;
+            }
+
+            if (branchId !== undefined) {
+                member.branchId = branchId || null;
+            }
+
+            const updatedMember = await member.save();
+
+            // Handle password update if provided
+            if (password && password.trim() !== '') {
+                const User = require('../models/User');
+                const userDoc = await User.findOne({ 
+                    $or: [
+                        { phone: oldPhone },
+                        { memberId: member._id }
+                    ]
+                });
+                if (userDoc) {
+                    userDoc.password = password.trim();
+                    userDoc.phone = member.phone;
+                    if (email) userDoc.email = email.trim().toLowerCase();
+                    await userDoc.save();
+                }
+            }
+
+            // Sync phone/email changes to auth User account
+            if (phone || email) {
+                const User = require('../models/User');
+                const userDoc = await User.findOne({ 
+                    $or: [
+                        { phone: oldPhone },
+                        { memberId: member._id }
+                    ]
+                });
+                if (userDoc) {
+                    if (phone) userDoc.phone = phone;
+                    if (email) userDoc.email = email.trim().toLowerCase();
+                    await userDoc.save();
+                }
+            }
+
+            // If division was switched, record an audit trail event
+            if (divisionSwitched) {
+                await logAudit(
+                    req,
+                    'MEMBER_DIVISION_SWITCHED',
+                    'Member',
+                    member._id,
+                    `Migrated ${member.name} from division '${oldDivision}' to '${newDivision}'`,
+                    member.name
+                );
+            } else {
+                await logAudit(req, 'MEMBER_UPDATED', 'Member', member._id, `Updated details for member ${member.name}`, member.name);
+            }
+
+            res.json(updatedMember);
+        } else {
+            res.status(404).json({ success: false, message: 'Member not found' });
+        }
+    } catch (error) { next(error); }
+});
+
+// @desc    Delete member
+// @route   DELETE /api/members/:id
+// @access  Private/Admin
+const deleteMember = catchAsync(async (req, res, next) => {
+    try {
+        const query = await buildMemberQuery(req, req.params.id);
+        const member = await Member.findOne(query);
+
+        if (member) {
+            const memberName = member.name;
+            await member.deleteOne();
+            await logAudit(req, 'MEMBER_DELETED', 'Member', req.params.id, `Deleted member ${memberName}`, memberName);
+            res.json({ message: 'Member removed' });
+        } else {
+            res.status(404).json({ success: false, message: 'Member not found' });
+        }
+    } catch (error) { next(error); }
+});
+
+// @desc    Export members as CSV
+// @route   GET /api/members/export/csv
+// @access  Private/Admin
+const exportMembersCSV = catchAsync(async (req, res, next) => {
+    try {
+        const query = await buildMemberQuery(req);
+        const members = await Member.find(query).populate('planId', 'name').lean();
+
+        const formattedData = members.map(m => ({
+            Name: m.name,
+            Phone: m.phone,
+            Email: m.email || '',
+            Plan: m.planId?.name || '',
+            Expiry: m.expiryDate ? m.expiryDate.toISOString().split('T')[0] : '',
+            Status: m.status
+        }));
+
+        const csv = jsonToCsv(formattedData, ['Name', 'Phone', 'Email', 'Plan', 'Expiry', 'Status']);
+
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename=members.csv');
+        res.status(200).send(csv);
+    } catch (error) { next(error); }
+});
+
+// @desc    Get member audit trail (history, division switches, and financial summary)
+// @route   GET /api/members/:id/audit-trail
+// @access  Private/Superadmin & Admin
+const getMemberAuditTrail = catchAsync(async (req, res, next) => {
+    try {
+        const member = await Member.findById(req.params.id).populate('planId', 'name price');
+        if (!member) {
+            res.status(404);
+            throw new Error('Member not found');
+        }
+
+        // Get all payments for this member
+        const Payment = require('../models/Payment');
+        const payments = await Payment.find({ memberId: member._id.toString() }).sort({ date: -1 }).lean();
+
+        // Get all audit logs relating to this member
+        const AuditLog = require('../models/AuditLog');
+        const auditLogs = await AuditLog.find({
+            $or: [
+                { entityId: member._id.toString() },
+                { entityName: member.name }
+            ]
+        }).sort({ createdAt: -1 }).lean();
+
+        // Calculate financial numbers accurately
+        const totalPaidFromPayments = payments.reduce((acc, p) => acc + (Number(p.amount) || 0), 0);
+        const catalogPrice = member.planId ? Number(member.planId.price) : (Number(member.planPrice) || 0);
+        const agreedPrice = member.planPrice !== undefined && member.planPrice !== null && member.planPrice > 0 ? Number(member.planPrice) : catalogPrice;
+        const discountAmount = Math.max(0, catalogPrice - agreedPrice);
+        const currentCyclePaid = member.paidAmount !== undefined && member.paidAmount !== null ? Number(member.paidAmount) : totalPaidFromPayments;
+        const pendingAmount = Math.max(0, agreedPrice - currentCyclePaid);
+
+        // Fetch gym name
+        const Gym = require('../models/Gym');
+        const gym = await Gym.findById(member.gymId);
+        const gymName = gym ? gym.name : 'Unknown Gym';
+
+        // Check when division switches happened from audit logs
+        const divisionSwitches = auditLogs
+            .filter(log => log.action === 'MEMBER_DIVISION_SWITCHED')
+            .map(log => ({
+                details: log.details,
+                timestamp: log.createdAt,
+                performedBy: log.userName
+            }));
+
+        res.json({
+            member: {
+                id: member._id,
+                name: member.name,
+                email: member.email,
+                phone: member.phone,
+                joinDate: member.joinDate,
+                joinMonth: new Date(member.joinDate).toLocaleString('default', { month: 'long', year: 'numeric' }),
+                status: member.status,
+                gymId: member.gymId,
+                gymName: gymName,
+                branchId: member.branchId,
+                currentPlan: member.planId ? {
+                    id: member.planId._id,
+                    name: member.planId.name,
+                    price: agreedPrice
+                } : null,
+                financials: {
+                    catalogPrice,
+                    discountAmount,
+                    planPrice: agreedPrice,
+                    paidAmount: currentCyclePaid,
+                    lifetimePaid: totalPaidFromPayments,
+                    pendingAmount: pendingAmount,
+                    totalPaymentsCount: payments.length
+                }
+            },
+            payments,
+            divisionSwitches,
+            auditLogs
+        });
+    } catch (error) { next(error); }
+});
+
+// @desc    Renew a member's plan
+// @route   POST /api/members/:id/renew
+// @access  Private/Admin
+const renewMember = catchAsync(async (req, res, next) => {
+    try {
+        const { planId, paidAmount = 0, discount = 0, finalPrice, method = 'Cash', salesType = 'RENEWAL', salesStaffId, saleSource = '' } = req.body;
+        const member = await Member.findOne(await buildMemberQuery(req, req.params.id));
+        if (!member) {
+            return res.status(404).json({ success: false, message: 'Member not found' });
+        }
+
+        const plan = await Plan.findById(planId || member.planId);
+        if (!plan) {
+            return res.status(404).json({ success: false, message: 'Plan not found' });
+        }
+        if (plan.gymId === 'SYSTEM' && Number(plan.sessions) <= 0) await migrateLegacyH4Plan(plan, member.gymId);
+        if (member.gymId === 'SYSTEM' || plan.gymId === 'SYSTEM' || String(plan.gymId) !== String(member.gymId)) {
+            return res.status(403).json({ success: false, message: 'FitPass subscriptions are renewed by members in the FitPass portal. Staff renewals must use a plan from the member’s gym.' });
+        }
+        if (plan.branchId && member.branchId && String(plan.branchId) !== String(member.branchId)) {
+            return res.status(403).json({ success: false, message: 'This plan is assigned to a different branch.' });
+        }
+
+        const now = new Date();
+        const baseDate = member.expiryDate && new Date(member.expiryDate) > now ? new Date(member.expiryDate) : now;
+        const newExpiry = new Date(baseDate);
+        if (plan.duration) {
+            newExpiry.setDate(newExpiry.getDate() + plan.duration);
+        } else {
+            newExpiry.setDate(newExpiry.getDate() + 30);
+        }
+
+        const numericDiscount = Math.max(0, Number(discount) || 0);
+        const catalogPrice = Number(plan.price) || 0;
+        const netAgreedPrice = finalPrice !== undefined && finalPrice !== null && finalPrice !== ''
+            ? Math.max(0, Number(finalPrice))
+            : Math.max(0, catalogPrice - numericDiscount);
+
+        member.planId = plan._id;
+        member.expiryDate = newExpiry;
+        member.status = 'Active';
+        member.planPrice = netAgreedPrice;
+
+        if (plan.sessions) {
+            const priorSessions = member.sessionsRemaining || 0;
+            member.sessionsRemaining = (member.sessionsRemaining || 0) + plan.sessions;
+            member.sessionsTotal = (member.sessionsTotal || 0) + plan.sessions;
+            const isH4Member = H4_GYM_IDS.includes(String(member.gymId));
+            if (!isH4Member) {
+                const coinConfig = await prisma.coinSettings.findUnique({ where: { division: 'fitpass' } }).catch(() => null);
+                member.fitpassCoins = (member.fitpassCoins || 0) + (plan.sessions + (!member.coinsMigrated ? priorSessions : 0)) * (coinConfig?.coinsPerSession || 10);
+                member.coinsMigrated = true;
+            }
+        }
+
+        const numericPaid = Number(paidAmount) || 0;
+        // When renewing/shifting plan, member's paidAmount for this active plan cycle tracks the amount paid towards netAgreedPrice
+        member.paidAmount = numericPaid;
+
+        const Payment = require('../models/Payment');
+        const salesStaff = salesStaffId
+            ? await User.findOne({ _id: salesStaffId, gymId: member.gymId }).lean() || await User.findOne({ name: salesStaffId, gymId: member.gymId }).lean()
+            : null;
+        await Payment.create({
+            memberId: member._id,
+            amount: numericPaid,
+            method,
+            date: now,
+            gymId: member.gymId,
+            branchId: member.branchId || null,
+            saleType: salesType === 'UPGRADE' ? 'UPGRADE' : 'RENEWAL',
+            source: saleSource,
+            staffId: salesStaff?._id || req.user.id || req.user._id || null,
+            staffName: salesStaff?.name || req.user.name || ''
+        });
+
+        await member.save();
+        await logAudit(
+            req,
+            'MEMBER_RENEWED',
+            'Member',
+            member._id,
+            `Renewed plan '${plan.name}' for ${member.name} (Catalogue: ₹${catalogPrice}, Discount: ₹${numericDiscount}, Net Fee: ₹${netAgreedPrice}, Paid: ₹${numericPaid})`,
+            member.name
+        );
+
+        res.json({ success: true, member });
+    } catch (error) { next(error); }
+});
+
+// @desc    Transfer member to a different branch
+// @route   PUT /api/members/:id/transfer
+// @access  Private/Admin
+const transferMember = catchAsync(async (req, res, next) => {
+    try {
+        const { targetBranchId } = req.body;
+        const member = await Member.findById(req.params.id);
+        if (!member) {
+            return res.status(404).json({ success: false, message: 'Member not found' });
+        }
+
+        member.branchId = targetBranchId || null;
+        await member.save();
+
+        // Also update linked user account if exists
+        await User.updateMany({ memberId: member._id }, { branchId: targetBranchId || null });
+
+        await logAudit(req, 'MEMBER_TRANSFERRED', 'Member', member._id, `Transferred ${member.name} to branch ID ${targetBranchId}`, member.name);
+
+        res.json({ success: true, member });
+    } catch (error) { next(error); }
+});
+
+module.exports = {
+    getMemberDivisionConversionOptions,
+    convertMemberDivision,
+    createMember,
+    getMembers,
+    getMemberById,
+    updateMember,
+    deleteMember,
+    getExpiringSoonMembers,
+    exportMembersCSV,
+    getMemberAuditTrail,
+    renewMember,
+    transferMember,
+};
+
